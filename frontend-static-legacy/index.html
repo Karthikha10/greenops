@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>GreenOps — Phase 1 Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-border: #232c42;
+    --text: #e7ecf7;
+    --muted: #8b96ab;
+    --accent: #4ade80;
+    --accent2: #38bdf8;
+    --warn: #fbbf24;
+    --danger: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--panel-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 {
+    font-size: 20px;
+    margin: 0;
+    letter-spacing: 0.3px;
+  }
+  header h1 span { color: var(--accent); }
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    margin-right: 6px;
+  }
+  nav {
+    display: flex;
+    gap: 4px;
+    padding: 12px 28px 0;
+    border-bottom: 1px solid var(--panel-border);
+    flex-wrap: wrap;
+  }
+  nav button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    padding: 10px 16px;
+    cursor: pointer;
+    font-size: 14px;
+    border-bottom: 2px solid transparent;
+  }
+  nav button.active {
+    color: var(--text);
+    border-bottom: 2px solid var(--accent);
+  }
+  main { padding: 24px 28px 60px; max-width: 1300px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 6px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--panel-border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  tr:hover { background: rgba(255,255,255,0.02); }
+  .badge {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.healthy { background: rgba(74,222,128,0.15); color: var(--accent); }
+  .badge.underutilized { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge.nodata { background: rgba(139,150,171,0.15); color: var(--muted); }
+  .badge.low { background: rgba(56,189,248,0.15); color: var(--accent2); }
+  .badge.medium { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge.high { background: rgba(248,113,113,0.15); color: var(--danger); }
+  .panel-title { font-size: 16px; margin: 28px 0 12px; color: var(--text); }
+  .chart-wrap { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+  .flex { display: flex; gap: 20px; flex-wrap: wrap; }
+  .flex > div { flex: 1; min-width: 320px; }
+  select, input { background: var(--panel); color: var(--text); border: 1px solid var(--panel-border); padding: 6px 10px; border-radius: 6px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .pill { display:inline-block; background: rgba(255,255,255,0.05); padding: 3px 10px; border-radius: 6px; font-size: 12px; margin-right: 6px; color: var(--muted); }
+  .empty-state { color: var(--muted); padding: 30px; text-align: center; border: 1px dashed var(--panel-border); border-radius: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Green<span>Ops</span> — Phase 1 Dashboard</h1>
+  <div class="muted"><span class="status-dot"></span>API: <span id="apiStatus">checking...</span></div>
+</header>
+
+<nav>
+  <button class="tab-btn active" data-tab="overview">Overview</button>
+  <button class="tab-btn" data-tab="servers">Servers</button>
+  <button class="tab-btn" data-tab="storage">Storage Optimization</button>
+  <button class="tab-btn" data-tab="analytics">Analytics</button>
+  <button class="tab-btn" data-tab="model">Model Evaluation</button>
+</nav>
+
+<main>
+
+  <!-- OVERVIEW -->
+  <div class="tab active" id="tab-overview">
+    <div class="grid" id="overviewCards"></div>
+    <div class="panel-title">Active Optimization Opportunities</div>
+    <table id="flagsTable">
+      <thead><tr><th>Server</th><th>Type</th><th>Severity</th><th>Detail</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- SERVERS -->
+  <div class="tab" id="tab-servers">
+    <div class="panel-title">Server Fleet</div>
+    <table id="serversTable">
+      <thead>
+        <tr><th>Server</th><th>Type</th><th>Region</th><th>CPU</th><th>Memory</th><th>Network (Gbps)</th><th>Avg CPU</th><th>Facility Power (kW)</th><th>Status</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="panel-title">Server Detail</div>
+    <div class="flex">
+      <div>
+        <label class="muted">Select server: </label>
+        <select id="serverSelect"></select>
+        <div class="chart-wrap" style="margin-top:14px;">
+          <canvas id="serverCpuChart" height="140"></canvas>
+        </div>
+        <div class="card" id="predictionCard" style="margin-top:14px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STORAGE -->
+  <div class="tab" id="tab-storage">
+    <div class="panel-title">Storage Optimization</div>
+    <p class="muted">Rule-based detection — no ML required. Flags stale, duplicate, and over-provisioned storage.</p>
+    <table id="storageTable">
+      <thead><tr><th>Server</th><th>Issue</th><th>Severity</th><th>Detail</th><th>Reclaimable (GB)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- ANALYTICS -->
+  <div class="tab" id="tab-analytics">
+    <div class="panel-title">Fleet-wide Trends</div>
+    <div class="flex">
+      <div class="chart-wrap"><canvas id="cpuHistoryChart" height="160"></canvas></div>
+      <div class="chart-wrap"><canvas id="powerHistoryChart" height="160"></canvas></div>
+    </div>
+  </div>
+
+  <!-- MODEL EVALUATION -->
+  <div class="tab" id="tab-model">
+    <div class="panel-title">CPU Estimation Model — Candidate Comparison</div>
+    <p class="muted">This model validates that our feature set explains resource behaviour. It is a validation layer, not the recommendation engine.</p>
+    <div id="modelContent"></div>
+  </div>
+
+</main>
+
+<script>
+const API = "http://localhost:8000";
+
+// ---- Tab switching ----
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+  });
+});
+
+async function j(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function checkApi() {
+  try {
+    await j(`${API}/`);
+    document.getElementById("apiStatus").textContent = "connected";
+  } catch (e) {
+    document.getElementById("apiStatus").textContent = "unreachable (start the backend)";
+  }
+}
+
+// ---- Overview ----
+async function loadOverview() {
+  try {
+    const s = await j(`${API}/analytics/summary`);
+    const cards = [
+      ["Avg CPU", s.avg_cpu + "%"],
+      ["Avg Memory", s.avg_memory + "%"],
+      ["PUE", s.pue],
+      ["Facility Power", s.avg_facility_power_kw + " kW"],
+      ["Est. Energy", s.estimated_energy_kwh + " kWh"],
+      ["Est. Cost", "₹" + s.estimated_cost],
+      ["Est. Carbon", s.estimated_carbon_kg + " kg CO2e"],
+      ["Est. Water (WUE)", s.estimated_water_l + " L"],
+      ["Total Storage", s.total_storage_gb + " GB"],
+      ["Stale Storage", s.stale_storage_gb + " GB"],
+      ["Active Flags", s.active_flags],
+    ];
+    document.getElementById("overviewCards").innerHTML = cards.map(([label, value]) =>
+      `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`
+    ).join("");
+  } catch (e) {
+    document.getElementById("overviewCards").innerHTML = `<div class="empty-state">No data yet — start the simulators.</div>`;
+  }
+
+  try {
+    const flags = await j(`${API}/flags`);
+    const tbody = document.querySelector("#flagsTable tbody");
+    tbody.innerHTML = flags.length ? flags.map(f => `
+      <tr>
+        <td>${f.server_id}</td>
+        <td>${f.flag_type.replace("_"," ")}</td>
+        <td><span class="badge ${f.severity}">${f.severity}</span></td>
+        <td class="muted">${f.detail}</td>
+      </tr>`).join("") : `<tr><td colspan="4" class="muted">No active flags.</td></tr>`;
+  } catch (e) {}
+}
+
+// ---- Servers ----
+async function loadServers() {
+  try {
+    const servers = await j(`${API}/servers`);
+    const tbody = document.querySelector("#serversTable tbody");
+    tbody.innerHTML = servers.map(s => `
+      <tr>
+        <td>${s.server_id}</td>
+        <td>${s.server_type}</td>
+        <td>${s.region}</td>
+        <td>${s.cpu ?? "-"}%</td>
+        <td>${s.memory ?? "-"}%</td>
+        <td>${s.network_gbps ?? "-"}</td>
+        <td>${s.avg_cpu ?? "-"}%</td>
+        <td>${s.facility_power_kw ?? "-"}</td>
+        <td><span class="badge ${s.state.toLowerCase().replace(" ","")}">${s.state}</span></td>
+      </tr>`).join("");
+
+    const select = document.getElementById("serverSelect");
+    if (select.options.length === 0) {
+      select.innerHTML = servers.map(s => `<option value="${s.server_id}">${s.server_id}</option>`).join("");
+      select.addEventListener("change", () => loadServerDetail(select.value));
+      if (servers.length) loadServerDetail(servers[0].server_id);
+    }
+  } catch (e) {
+    document.querySelector("#serversTable tbody").innerHTML = `<tr><td colspan="9" class="muted">No data yet — start the simulators.</td></tr>`;
+  }
+}
+
+let cpuChart;
+async function loadServerDetail(serverId) {
+  try {
+    const history = await j(`${API}/servers/${serverId}/history?hours=6`);
+    const labels = history.map(h => new Date(h.timestamp).toLocaleTimeString());
+    const cpuData = history.map(h => h.cpu);
+
+    const ctx = document.getElementById("serverCpuChart").getContext("2d");
+    if (cpuChart) cpuChart.destroy();
+    cpuChart = new Chart(ctx, {
+      type: "line",
+      data: { labels, datasets: [{ label: `${serverId} CPU %`, data: cpuData, borderColor: "#4ade80", tension: 0.3, pointRadius: 0 }] },
+      options: { responsive: true, plugins: { legend: { labels: { color: "#e7ecf7" } } },
+        scales: { x: { ticks: { color: "#8b96ab" } }, y: { ticks: { color: "#8b96ab" } } } }
+    });
+  } catch (e) {}
+
+  try {
+    const pred = await j(`${API}/servers/${serverId}/prediction`);
+    const powerRow = pred.predicted_power_kw !== undefined ? `
+      <div class="flex" style="margin-top:8px;">
+        <div class="pill">Measured IT Power: ${pred.measured_it_power_kw} kW</div>
+        <div class="pill">Predicted Power: ${pred.predicted_power_kw} kW</div>
+      </div>` : "";
+    document.getElementById("predictionCard").innerHTML = `
+      <div class="label">ML Validation — Measured vs Estimated CPU</div>
+      <div class="flex" style="margin-top:8px;">
+        <div class="pill">Measured: ${pred.measured_cpu}%</div>
+        <div class="pill">Predicted: ${pred.predicted_cpu}%</div>
+        <div class="pill">Abs. Error: ${pred.absolute_error} pp</div>
+      </div>
+      ${powerRow}`;
+  } catch (e) {
+    document.getElementById("predictionCard").innerHTML = `<div class="muted">Model not trained yet, or not enough telemetry. Run train_model.py.</div>`;
+  }
+}
+
+// ---- Storage ----
+async function loadStorage() {
+  try {
+    const flags = await j(`${API}/storage/flags`);
+    const tbody = document.querySelector("#storageTable tbody");
+    tbody.innerHTML = flags.length ? flags.map(f => `
+      <tr>
+        <td>${f.server_id}</td>
+        <td>${f.flag_type.replace("_"," ")}</td>
+        <td><span class="badge ${f.severity}">${f.severity}</span></td>
+        <td class="muted">${f.detail}</td>
+        <td>${f.metric_value_gb}</td>
+      </tr>`).join("") : `<tr><td colspan="5" class="muted">No storage issues detected yet.</td></tr>`;
+  } catch (e) {
+    document.querySelector("#storageTable tbody").innerHTML = `<tr><td colspan="5" class="muted">No data yet — start storage_monitor.py.</td></tr>`;
+  }
+}
+
+// ---- Analytics ----
+let cpuHistChart, powerHistChart;
+async function loadAnalytics() {
+  try {
+    const hist = await j(`${API}/analytics/history?hours=6`);
+    const cpuLabels = hist.cpu_series.map(p => new Date(p.t).toLocaleTimeString());
+    const cpuVals = hist.cpu_series.map(p => p.v);
+    const powerLabels = hist.power_series.map(p => new Date(p.t).toLocaleTimeString());
+    const powerVals = hist.power_series.map(p => p.v);
+
+    const ctx1 = document.getElementById("cpuHistoryChart").getContext("2d");
+    if (cpuHistChart) cpuHistChart.destroy();
+    cpuHistChart = new Chart(ctx1, {
+      type: "line",
+      data: { labels: cpuLabels, datasets: [{ label: "Fleet CPU %", data: cpuVals, borderColor: "#38bdf8", tension: 0.3, pointRadius: 0 }] },
+      options: { plugins: { legend: { labels: { color: "#e7ecf7" } } }, scales: { x: { ticks: { color: "#8b96ab" } }, y: { ticks: { color: "#8b96ab" } } } }
+    });
+
+    const ctx2 = document.getElementById("powerHistoryChart").getContext("2d");
+    if (powerHistChart) powerHistChart.destroy();
+    powerHistChart = new Chart(ctx2, {
+      type: "line",
+      data: { labels: powerLabels, datasets: [{ label: "Facility Power (kW)", data: powerVals, borderColor: "#fbbf24", tension: 0.3, pointRadius: 0 }] },
+      options: { plugins: { legend: { labels: { color: "#e7ecf7" } } }, scales: { x: { ticks: { color: "#8b96ab" } }, y: { ticks: { color: "#8b96ab" } } } }
+    });
+  } catch (e) {}
+}
+
+// ---- Model evaluation ----
+function renderModelTable(section) {
+  const rows = Object.entries(section.results).map(([name, metrics]) => `
+    <tr>
+      <td>${name} ${name === section.selected_model ? '<span class="badge low">selected</span>' : ""}</td>
+      <td>${metrics.MAE}</td>
+      <td>${metrics.RMSE}</td>
+      <td>${metrics.R2}</td>
+    </tr>`).join("");
+  return `
+    <table>
+      <thead><tr><th>Model</th><th>MAE ↓</th><th>RMSE ↓</th><th>R² ↑</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="muted" style="margin: 8px 0 22px;">Target: <code>${section.target}</code> — ${section.note}</p>`;
+}
+
+async function loadModel() {
+  try {
+    const m = await j(`${API}/model/evaluation`);
+    document.getElementById("modelContent").innerHTML = `
+      <div class="grid">
+        <div class="card"><div class="label">Dataset Rows</div><div class="value">${m.dataset_rows}</div></div>
+        <div class="card"><div class="label">Missing region values</div><div class="value">${m.missing_values.datacenter_region}</div></div>
+        <div class="card"><div class="label">Data Source</div><div class="value" style="font-size:14px;">Real Kaggle dataset</div></div>
+      </div>
+      <p class="muted">${m.source}</p>
+
+      <h3 style="margin-top:24px;">CPU Estimation Model</h3>
+      ${renderModelTable(m.cpu_model)}
+
+      <h3>Power Estimation Model</h3>
+      ${renderModelTable(m.power_model)}
+      <p class="muted">Note: R² is noticeably lower here — this is an honest result of the real dataset, not a bug. It means power_consumption_kw depends on factors beyond what these features capture as well as they explain CPU.</p>
+      `;
+  } catch (e) {
+    document.getElementById("modelContent").innerHTML = `<div class="empty-state">Model not trained yet.<br/>Run: <code>python -m app.train_model</code> inside the backend folder.</div>`;
+  }
+}
+
+// ---- Init + polling ----
+async function refreshAll() {
+  await checkApi();
+  await loadOverview();
+  await loadServers();
+  await loadStorage();
+  await loadAnalytics();
+  await loadModel();
+}
+
+refreshAll();
+setInterval(refreshAll, 15000);
+</script>
+
+</body>
+</html>

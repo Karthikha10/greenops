@@ -1,0 +1,87 @@
+{
+  "dataset_rows": 10000,
+  "dataset_columns": 15,
+  "missing_values": {
+    "datacenter_region": 3990
+  },
+  "imputation_strategy": "most_frequent category, applied inside the sklearn Pipeline",
+  "selection_rule": "Lowest MAE wins, but a more complex model (Random Forest / XGBoost) must beat Linear Regression by at least 5% relative MAE improvement to be selected over it -- otherwise the simpler, more explainable model is kept.",
+  "cpu_model": {
+    "selected_model": "LinearRegression",
+    "results": {
+      "LinearRegression": {
+        "MAE": 4.511,
+        "RMSE": 7.671,
+        "R2": 0.845
+      },
+      "RandomForest": {
+        "MAE": 4.828,
+        "RMSE": 8.077,
+        "R2": 0.828
+      },
+      "XGBoost": {
+        "MAE": 4.833,
+        "RMSE": 7.999,
+        "R2": 0.831
+      }
+    },
+    "features": {
+      "numeric": [
+        "workload_intensity",
+        "memory_utilization",
+        "network_throughput_gbps",
+        "inlet_temperature_c",
+        "cooling_efficiency",
+        "pue"
+      ],
+      "categorical": [
+        "server_type",
+        "cooling_type",
+        "datacenter_region",
+        "time_of_day"
+      ]
+    },
+    "target": "cpu_utilization",
+    "note": "cpu_utilization is excluded from its own inputs to avoid target leakage."
+  },
+  "power_model": {
+    "selected_model": "LinearRegression",
+    "results": {
+      "LinearRegression": {
+        "MAE": 13.137,
+        "RMSE": 20.551,
+        "R2": 0.422
+      },
+      "RandomForest": {
+        "MAE": 14.149,
+        "RMSE": 21.539,
+        "R2": 0.366
+      },
+      "XGBoost": {
+        "MAE": 13.818,
+        "RMSE": 21.207,
+        "R2": 0.385
+      }
+    },
+    "features": {
+      "numeric": [
+        "workload_intensity",
+        "cpu_utilization",
+        "memory_utilization",
+        "network_throughput_gbps",
+        "inlet_temperature_c",
+        "cooling_efficiency",
+        "pue"
+      ],
+      "categorical": [
+        "server_type",
+        "cooling_type",
+        "datacenter_region",
+        "time_of_day"
+      ]
+    },
+    "target": "power_consumption_kw",
+    "note": "cpu_utilization IS included here since power, not CPU, is the target."
+  },
+  "source": "Real 'Green AI Data Center Telemetry' dataset (Kaggle), 10,000 rows, as uploaded by the user -- not synthetic."
+}
