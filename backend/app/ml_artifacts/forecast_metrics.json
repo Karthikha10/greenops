@@ -1,0 +1,44 @@
+{
+  "model_version": "workload-forecast-v1",
+  "selected_model": "RandomForest",
+  "selected_metrics": {
+    "MAE": 1.657,
+    "RMSE": 2.038,
+    "R2": 0.989
+  },
+  "all_results": {
+    "LinearRegression": {
+      "MAE": 7.332,
+      "RMSE": 8.596,
+      "R2": 0.808
+    },
+    "RandomForest": {
+      "MAE": 1.657,
+      "RMSE": 2.038,
+      "R2": 0.989
+    }
+  },
+  "feature_columns": [
+    "cpu_lag_5m",
+    "cpu_lag_10m",
+    "cpu_lag_15m",
+    "cpu_lag_20m",
+    "avg_cpu_last_hour",
+    "memory_utilization",
+    "workload_intensity",
+    "network_throughput_gbps",
+    "hour_sin",
+    "hour_cos"
+  ],
+  "target": "cpu_utilization at 15 minutes in the future",
+  "horizon_minutes": 15,
+  "source_rows": 1103,
+  "training_samples": 73,
+  "train_samples": 58,
+  "test_samples": 15,
+  "training_from": "2026-08-31T16:19:06.349457",
+  "training_to": "2026-08-31T16:29:51.205834",
+  "trained_at": "2026-09-01T12:37:15.969156",
+  "selection_rule": "A complex model must beat Linear Regression by more than 5% relative MAE to be selected.",
+  "limitation": "Forecast continues observed patterns; it cannot anticipate one-off traffic spikes or failures."
+}

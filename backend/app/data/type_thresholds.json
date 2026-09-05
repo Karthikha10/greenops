@@ -1,0 +1,43 @@
+{
+  "Compute": {
+    "idle_cpu_threshold": 17.3,
+    "dataset_cpu_mean": 46.52,
+    "dataset_cpu_std": 19.48,
+    "avg_power_kw": 80.98,
+    "severity_weight": 1.22,
+    "sample_count": 4058
+  },
+  "Edge": {
+    "idle_cpu_threshold": 18.9,
+    "dataset_cpu_mean": 47.52,
+    "dataset_cpu_std": 19.07,
+    "avg_power_kw": 66.5,
+    "severity_weight": 1.0,
+    "sample_count": 961
+  },
+  "GPU": {
+    "idle_cpu_threshold": 16.9,
+    "dataset_cpu_mean": 45.63,
+    "dataset_cpu_std": 19.16,
+    "avg_power_kw": 110.48,
+    "severity_weight": 1.66,
+    "sample_count": 1926
+  },
+  "Storage": {
+    "idle_cpu_threshold": 16.8,
+    "dataset_cpu_mean": 46.16,
+    "dataset_cpu_std": 19.56,
+    "avg_power_kw": 70.57,
+    "severity_weight": 1.06,
+    "sample_count": 3055
+  },
+  "_default": {
+    "idle_cpu_threshold": 20.0,
+    "dataset_cpu_mean": null,
+    "dataset_cpu_std": null,
+    "avg_power_kw": null,
+    "severity_weight": 1.0,
+    "sample_count": 0,
+    "note": "fallback for a server_type not seen in the historical dataset"
+  }
+}
