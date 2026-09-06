@@ -48,6 +48,15 @@ below. **Explicitly not built: criticality/SLA gating** — the roadmap's item
 read as gating a consolidation recommendation on whether a server is
 critical — it isn't, on purpose, until that's built.
 
+**Also explicitly narrower than it sounds: "safe" only ever means CPU and
+memory.** The consolidation safety check (`SAFETY_LIMIT_PERCENT` in
+`recommendations.py`) never evaluates network throughput, cooling/thermal
+headroom, target storage capacity, or electrical/power capacity — see
+"Phase 2" below, `recommendations.py`, for exactly which of those feed the
+power *estimate* without ever gating the *decision*. Don't describe a
+recommendation as having "considered everything" about the target — it
+hasn't, by design so far, not by oversight of this specific fact.
+
 ---
 
 ## Repo layout (current, accurate)
@@ -322,8 +331,10 @@ CSS classes from `index.css` (`.metric-card`, `.badge`, `.card`,
 ## Phase 2 — what's actually built
 
 Everything below is real, tested end to end against live telemetry — not
-design notes. **Criticality/SLA gating is the one deliberate exception, not
-built.**
+design notes. **Criticality/SLA gating is one deliberate exception, not
+built; the narrow definition of "safe" (CPU/memory only) below is another,
+named the moment it was noticed rather than something built-in from the
+start.**
 
 **`forecasting.py` / `train_workload_forecast.py`** — near-term (15/30/60min)
 CPU forecast, gated to only run for servers currently idle/underutilized by
@@ -448,6 +459,41 @@ Used by `_rank_consolidation_candidates()` below — not used anywhere else.
    or it would silently corrupt it by mixing two different data-generating
    regimes. Check `power_monitor.py`'s git history / a timestamp cutoff
    before trusting any bulk export of `power_telemetry` for that purpose.
+5. **"Safe" means CPU and memory only — nothing else is a gate, even
+   though other metrics are collected.** Precisely, by dimension:
+   - **CPU / memory** — the only two dimensions actually compared against
+     `SAFETY_LIMIT_PERCENT` (75%), both for the current-snapshot check
+     (`safe_now`) and the forecast check (`safe_forecast`, point 2 above).
+   - **Network throughput** — fed into the power model as an *input
+     feature* (the post-move value: target's current + source's current ×
+     0.9, same overhead factor as CPU/memory), so it shapes the predicted
+     kW/₹ number. **No threshold exists for it anywhere** — there's no
+     network equivalent of the 75% limit, so a move that would saturate a
+     target's network is not rejected, or even flagged, on that basis.
+   - **Cooling efficiency / inlet temperature** — same treatment as
+     network: input features to the power model's prediction, never
+     compared against a thermal capacity limit. A target with poor cooling
+     doesn't get penalized in the safety decision, only in the power
+     number that comes out the other side.
+   - **Target's storage capacity** — not evaluated at all for a
+     consolidation. This action only ever moves compute workload
+     (CPU/memory); storage actions (archive/dedupe/rightsize) are a
+     completely separate code path that never intersects with
+     consolidation safety.
+   - **Electrical/power capacity** — no modeled ceiling on how much power
+     a rack or PDU can actually supply. The system will predict an
+     arbitrarily high post-move kW draw with nothing stopping it.
+   - **Criticality/SLA** — the pre-existing, already-documented gap above;
+     listed here again only so this becomes one place that names every
+     current boundary of "safe" together, rather than scattering them.
+
+   **Don't describe a recommendation as having "considered everything"
+   about the target.** It considers CPU and memory, now and by forecast —
+   real and genuinely useful, but a narrower claim than "safe" can sound
+   like standing alone. If asked to widen this (network/thermal/power
+   capacity thresholds, or storage-aware consolidation), treat it as new
+   scoped work, the same way target-forecasting was — not a quick tweak to
+   the existing threshold check.
 
 **Recommendations UI is list → detail, not one long page of expanded
 cards.** `/recommendations` is a compact table (server, action, priority,
