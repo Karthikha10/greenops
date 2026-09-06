@@ -832,10 +832,23 @@ export default function RecommendationDetail() {
                 marginBottom: 14,
               }}
             >
-              Estimated using transparent formulas from
-              current telemetry and configured environmental
-              and cost assumptions. No ML model is used
-              for these impact calculations.
+              {impact.model_predicted_target_it_power_kw !== undefined &&
+              impact.model_predicted_target_it_power_kw !== null ? (
+                <>
+                  Energy uses the trained power model's prediction for the
+                  target's full post-move profile (CPU, memory, network,
+                  cooling), scaled to facility power by its current PUE.
+                  Carbon, cost and water are transparent formulas applied
+                  on top of that energy estimate.
+                </>
+              ) : (
+                <>
+                  Estimated using transparent formulas from current
+                  telemetry and configured environmental and cost
+                  assumptions. The trained power model wasn't available for
+                  this target, so no ML model is used for this estimate.
+                </>
+              )}
             </p>
 
 
