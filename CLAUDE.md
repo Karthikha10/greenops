@@ -226,15 +226,26 @@ single-row predictions. Fixed and retrained; offline metrics unchanged
 
 | | CPU model | Power model |
 |---|---|---|
-| Target | `cpu_utilization` | `power_consumption_kw` |
+| Target | `cpu_utilization` | `power_consumption_kw_rescaled` (see rescale note below) |
 | Numeric inputs | workload_intensity, memory_utilization, network_throughput_gbps, inlet_temperature_c, cooling_efficiency, pue | same six **+ `cpu_utilization`** |
 | Categorical inputs | server_type, cooling_type, datacenter_region, time_of_day | same |
-| Role | Validation layer — proves the feature set explains resource behavior. **Not** the recommendation engine. | Will feed Phase 2's what-if engine |
-| Real MAE / RMSE / R² | 4.51 / 7.67 / 0.845 | 13.14 / 20.55 / 0.42 |
+| Role | Validation layer — proves the feature set explains resource behavior. **Not** the recommendation engine. | Primary basis for What-If's energy estimate — see "Phase 2 — what's actually built" → `recommendations.py` below for what changed and why |
+| Real MAE / RMSE / R² | 4.51 / 7.67 / 0.845 | 0.211 / 0.330 / 0.422 (rescaled kW — see below) |
 
 CPU model deliberately excludes its own target (leakage); power model
 includes CPU as input (legitimate — CPU isn't the target there). **Don't
 "fix" this into symmetry — the asymmetry is correct.**
+
+**Power model target is rescaled before training** (`rescale_power_target()`
+in `train_model.py`) — the Kaggle dataset's `power_consumption_kw` runs
+28-233kW (real data-center scale); live telemetry runs ~1.2-4.5kW. A linear
+min-max transform maps the training target into
+`LIVE_IT_POWER_MIN_KW`..`LIVE_IT_POWER_MAX_KW` before training, so the
+model's output is directly usable against live numbers. This is a pure unit
+change, not a different fit — confirmed by R² being numerically identical
+(0.422) before and after the rescale was introduced. The MAE/RMSE above are
+now in rescaled kW, not the dataset's original scale — don't compare them
+against an older copy of this doc that shows 13.14/20.55.
 
 **Candidates & hyperparameters** (all trained on the same 80/20 split,
 `random_state=42`):
@@ -339,13 +350,65 @@ exist; falls back to transparent trend extrapolation until then, and says so
 3. The top-ranked **safe** candidate is the one actually used for the impact
    estimate below it; if none qualify, `"safe": false` with a stated reason
    — never silently approved.
-4. Energy/cost/carbon/water savings scale the **target's own current live
-   facility power** by its post-move CPU ratio — deliberately **not** fed
-   through the trained power model, because that model's absolute scale
-   doesn't match live simulated telemetry (same documented gap as the CPU/
-   power validation models — see "The two ML models" above). The model's raw
-   prediction is still surfaced as `model_predicted_target_it_power_kw`, for
-   transparency, never for the dollar figure.
+4. Energy/cost/carbon/water savings prefer the **trained power model's
+   prediction** for the target's full post-move profile (CPU, memory,
+   network, cooling) — scaled from predicted IT power to facility power by
+   the target's current PUE. This is the primary basis for `energy_after`
+   whenever `power_model` and the target's cooling telemetry are both
+   available. It falls back to the older, simpler formula (**target's own
+   current live facility power scaled by its post-move CPU ratio**) only
+   when either is missing. See "The two ML models" above for the rescale
+   mechanics.
+
+   **This was NOT always wired in — read this if the formula looks wrong.**
+   For most of Phase 2's life, the power model's raw output was deliberately
+   *never* used for the dollar figure, only surfaced as
+   `model_predicted_target_it_power_kw` for transparency, because two
+   separate problems made using it dishonest:
+   1. **Scale mismatch** — the model was trained on the Kaggle dataset's own
+      power range (tens-to-hundreds of kW); live telemetry runs single-digit
+      kW. Fixed in `train_model.py` via `rescale_power_target()` — a linear
+      min-max transform of the training target down to
+      `LIVE_IT_POWER_MIN_KW`..`LIVE_IT_POWER_MAX_KW` before training. Same
+      learned relationships, different output units — confirmed by R²
+      staying identical (0.422) before and after rescaling.
+   2. **The live simulator had zero causal relationship between load and
+      power to begin with** — `simulators/power_monitor.py` generated
+      `it_power_kw` via pure `random.uniform(1.5, 4.5)`, completely
+      independent of CPU/memory. Applying a real-world-trained model to
+      that would have produced a number that *looked* ML-validated while
+      being no more meaningful than the noise it was applied to — worse
+      than the honest CPU-ratio formula, not better. **Fixed by making
+      power_monitor.py itself respond to real load**: it now fetches each
+      server's current CPU/memory from `GET /servers` before generating a
+      reading, and computes `it_power = BASELINE_IT_KW + variable component
+      weighted 85% CPU / 15% memory + noise`, landing in the same overall
+      range (~1.2–4.5kW) the simulator always used — S6's old hardcoded
+      "always low power" special case was removed as a result; it's simply
+      low now because its CPU is genuinely low, the same reason a real idle
+      server draws less power. **Do not revert this to random generation.**
+
+   **Even after both fixes, this remains an estimate, not a measurement**
+   — the model's learned relationship (from real Kaggle servers) and
+   `power_monitor.py`'s hand-written formula are two independently-built
+   approximations of the same idea. They now agree on direction and scale,
+   but won't numerically match exactly for a given CPU/memory input — the
+   same "train/inference distribution shift" already documented for the
+   CPU/power validation models. `calculate_what_if()`'s assumptions list
+   says this explicitly every time the model is used. Don't let this
+   get framed as "solved" or "now accurate" — it's "now legitimate to use,"
+   which is a different, more honest claim.
+
+   **A landmine for a future retraining effort, noted here so it isn't
+   hit blind:** telemetry collected *before* the power_monitor.py fix has
+   power generated the old random way (zero correlation). If a future
+   session ever pursues training the power model directly on accumulated
+   live data instead of the Kaggle CSV (previously called "Option 2" —
+   not viable yet, only ~2 hours of live history exists as of this
+   writing), that pre-fix data **must be excluded** from that training set,
+   or it would silently corrupt it by mixing two different data-generating
+   regimes. Check `power_monitor.py`'s git history / a timestamp cutoff
+   before trusting any bulk export of `power_telemetry` for that purpose.
 
 **Recommendations UI is list → detail, not one long page of expanded
 cards.** `/recommendations` is a compact table (server, action, priority,
@@ -501,6 +564,25 @@ re-verified live:**
     built" above), which returns the full ranked list; the what-if response
     now exposes it as `candidates`, and `RecommendationDetail.jsx` renders
     it as a table.
+17. **Power model was structurally unusable for What-If, for two stacked
+    reasons, not one** — (a) trained on the Kaggle dataset's power scale
+    (tens-to-hundreds of kW) vs. live telemetry's single-digit kW, and (b)
+    `power_monitor.py`'s `it_power_kw` was pure `random.uniform(1.5, 4.5)`
+    with **zero relationship to CPU/memory/anything else** — so even a
+    correctly-scaled model would have been applying a real-world learned
+    relationship to a live domain that had no such relationship to begin
+    with, which is worse than not using the model at all. Fixed both:
+    `train_model.py` now rescales the training target
+    (`rescale_power_target()`) into the live IT-power range, and
+    `power_monitor.py` now generates `it_power_kw` as a real function of
+    each server's current CPU (85% weight) and memory (15% weight) plus a
+    baseline idle draw, fetched live from `GET /servers` each cycle. With
+    both fixed, `calculate_what_if()` now uses the power model as the
+    primary basis for the post-move energy estimate (falls back to the old
+    CPU-ratio formula only if the model or target cooling telemetry is
+    unavailable) — see "Phase 2 — what's actually built" → `recommendations.py`
+    above for the full reasoning and the honest limits that remain even
+    after this fix.
 
 If something looks numerically "off" again, check for the same class of
 issue: an assumption about cadence/scale that isn't actually enforced

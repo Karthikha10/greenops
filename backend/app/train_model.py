@@ -64,6 +64,20 @@ POWER_NUMERIC_FEATURES = [
     "network_throughput_gbps", "inlet_temperature_c", "cooling_efficiency", "pue",
 ]
 POWER_TARGET = "power_consumption_kw"
+POWER_TARGET_RESCALED = "power_consumption_kw_rescaled"
+
+# The Kaggle dataset's power_consumption_kw runs tens-to-hundreds of kW (real
+# data center scale). Our live telemetry simulator runs single-digit kW
+# (simulators/power_monitor.py: ~1.2-4.5 kW IT power per server). Training
+# directly on the dataset's own scale produced predictions 20-40x too large
+# to use anywhere near live numbers. Rather than leave the model unusable
+# outside a standalone comparison, we linearly rescale the target into the
+# live IT-power range below before training -- same real relationships
+# (higher CPU/workload -> higher power), just projected onto the range this
+# system's own telemetry actually occupies. This does NOT change what the
+# model learned, only what units its output is expressed in.
+LIVE_IT_POWER_MIN_KW = 1.2
+LIVE_IT_POWER_MAX_KW = 4.5
 
 
 def load_and_clean_dataset():
@@ -82,6 +96,31 @@ def load_and_clean_dataset():
     # mutating the DataFrame in place, so the exact same imputation is
     # replayed consistently at inference time on live telemetry.
     return df
+
+
+def rescale_power_target(df):
+    """
+    Linearly rescale power_consumption_kw from the Kaggle dataset's own
+    range down to LIVE_IT_POWER_MIN_KW..LIVE_IT_POWER_MAX_KW, preserving
+    relative ordering and shape (min-max scaling), so the model trained on
+    it produces output directly comparable to live telemetry.
+    """
+    kaggle_min = df[POWER_TARGET].min()
+    kaggle_max = df[POWER_TARGET].max()
+    kaggle_range = kaggle_max - kaggle_min
+
+    live_range = LIVE_IT_POWER_MAX_KW - LIVE_IT_POWER_MIN_KW
+
+    df[POWER_TARGET_RESCALED] = LIVE_IT_POWER_MIN_KW + (
+        (df[POWER_TARGET] - kaggle_min) / kaggle_range
+    ) * live_range
+
+    return df, {
+        "kaggle_min_kw": round(float(kaggle_min), 2),
+        "kaggle_max_kw": round(float(kaggle_max), 2),
+        "live_min_kw": LIVE_IT_POWER_MIN_KW,
+        "live_max_kw": LIVE_IT_POWER_MAX_KW,
+    }
 
 
 def build_pipeline(model, numeric_features):
@@ -186,8 +225,14 @@ def main():
     joblib.dump(cpu_pipeline, os.path.join(MODEL_DIR, "cpu_model.joblib"))
 
     # ---- Power estimation model ----
+    # Trained on a rescaled target so its output lands in the same range as
+    # live telemetry (see rescale_power_target() docstring) -- the model
+    # still learns from the real Kaggle relationships, just expressed on a
+    # different scale, exactly like a unit conversion.
+    df, rescale_info = rescale_power_target(df)
     power_winner, power_pipeline, power_results = train_target(
-        df, POWER_TARGET, POWER_NUMERIC_FEATURES, "used by the Phase 2 what-if engine"
+        df, POWER_TARGET_RESCALED, POWER_NUMERIC_FEATURES,
+        "used by the Phase 2 what-if engine -- rescaled to live IT-power range"
     )
     joblib.dump(power_pipeline, os.path.join(MODEL_DIR, "power_model.joblib"))
 
@@ -211,8 +256,11 @@ def main():
             "selected_model": power_winner,
             "results": power_results,
             "features": {"numeric": POWER_NUMERIC_FEATURES, "categorical": CATEGORICAL_FEATURES},
-            "target": POWER_TARGET,
-            "note": "cpu_utilization IS included here since power, not CPU, is the target.",
+            "target": POWER_TARGET_RESCALED,
+            "note": "cpu_utilization IS included here since power, not CPU, is the target. "
+                    "MAE/RMSE below are in rescaled kW (live IT-power scale), not the "
+                    "dataset's own kW scale -- see rescale below.",
+            "rescale": rescale_info,
         },
         "source": "Real 'Green AI Data Center Telemetry' dataset (Kaggle), 10,000 rows, "
                    "as uploaded by the user -- not synthetic.",

@@ -243,8 +243,9 @@ def _predict_power_kw(
     """
     Reuse the trained power model exactly as /servers/{id}/prediction does.
 
-    This prediction is provided only as an additional transparent model
-    output. It is NOT used for the primary consolidation impact calculation.
+    calculate_what_if() uses this as the primary basis for its post-move
+    energy estimate when both the model and the target's cooling telemetry
+    are available; otherwise it falls back to a simpler CPU-ratio formula.
     """
 
     if power_model is None or cooling is None:
@@ -406,8 +407,18 @@ def calculate_what_if(
             + target facility power
 
         Energy After
+            = trained power model's prediction for the target's
+              full post-move profile (CPU, memory, network,
+              cooling), scaled from IT power to facility power
+              by the target's current PUE
+
+              -- falls back to --
+
             = target facility power
             × post-move CPU / current target CPU
+
+              when the power model or the target's cooling
+              telemetry isn't available
 
         Energy Saving
             = energy before - energy after
@@ -439,8 +450,11 @@ def calculate_what_if(
         Water Saving
             = water before - water after
 
-    These impact calculations are formula-based.
-    The ML power model is NOT required for them.
+    Carbon/cost/water are always simple formulas on top of energy.
+    Energy itself prefers the trained power model (see Energy After
+    above) but degrades gracefully to a formula-only estimate when
+    the model or target cooling telemetry isn't available -- this
+    function never raises just because the model is missing.
     """
 
     server_id = recommendation.server_id
@@ -734,31 +748,99 @@ def calculate_what_if(
             # Source server is assumed to be powered down
             # after successful consolidation.
             #
-            # The target's facility power is scaled according
-            # to its simulated CPU utilization increase.
+            # Preferred method: the trained power model's
+            # prediction for the target's full post-move
+            # profile (CPU, memory, network, cooling) -- now
+            # that train_model.py rescales the model's output
+            # to the same range live telemetry occupies, this
+            # is more informative than a single linear CPU
+            # scale, since it accounts for memory/network too.
             #
-            # This is a transparent formula, not ML.
+            # Falls back to the transparent CPU-ratio formula
+            # only when the model or the target's cooling
+            # telemetry isn't available.
             # ------------------------------------------------
 
             current_target_cpu = float(
                 target_telemetry.cpu_utilization or 0
             )
 
-            if current_target_cpu > 0:
+            target_pue = None
+            predicted_it_kw = None
 
-                cpu_ratio = (
-                    post_move_cpu
-                    / current_target_cpu
+            if power_model is not None and target_cooling is not None:
+
+                target_pue = rules_engine.compute_pue(
+                    target_power.it_power_kw,
+                    target_power.facility_power_kw,
                 )
+
+                predicted_it_kw = _predict_power_kw(
+                    power_model,
+                    target,
+                    target_cooling,
+                    pue=target_pue,
+                    cpu_value=post_move_cpu,
+                    memory_value=post_move_memory,
+                    network_value=(
+                        target_telemetry.network_throughput_gbps
+                        or 0
+                    )
+                    +
+                    (
+                        source_telemetry.network_throughput_gbps
+                        or 0
+                    )
+                    * CONSOLIDATION_OVERHEAD_FACTOR,
+                    workload_value=min(
+                        1.0,
+                        (
+                            target_telemetry.workload_intensity
+                            or 0
+                        )
+                        +
+                        (
+                            source_telemetry.workload_intensity
+                            or 0
+                        )
+                        * CONSOLIDATION_OVERHEAD_FACTOR,
+                    ),
+                )
+
+            used_model_for_estimate = (
+                predicted_it_kw is not None
+                and target_pue
+            )
+
+            if used_model_for_estimate:
+
+                # IT power -> facility power via the target's own
+                # current PUE, same relationship power_monitor.py
+                # itself uses (facility = IT x overhead ratio).
+                predicted_after_kw = (
+                    predicted_it_kw
+                    * target_pue
+                )
+
+                cpu_ratio = None
 
             else:
 
-                cpu_ratio = 1.0
+                if current_target_cpu > 0:
 
-            predicted_after_kw = (
-                target_facility_power_kw
-                * cpu_ratio
-            )
+                    cpu_ratio = (
+                        post_move_cpu
+                        / current_target_cpu
+                    )
+
+                else:
+
+                    cpu_ratio = 1.0
+
+                predicted_after_kw = (
+                    target_facility_power_kw
+                    * cpu_ratio
+                )
 
             energy_after_kwh = max(
                 predicted_after_kw,
@@ -959,12 +1041,38 @@ def calculate_what_if(
                 f"facility power ({target_facility_power_kw:.2f} kW)."
             )
 
-            result["assumptions"].append(
-                f"Energy after = target facility power "
-                f"({target_facility_power_kw:.2f} kW) × "
-                f"post-move CPU ratio ({cpu_ratio:.2f}). "
-                "The source server is assumed to be powered down."
-            )
+            if used_model_for_estimate:
+
+                result["assumptions"].append(
+                    f"Energy after uses the trained power model's "
+                    f"prediction for {target.server_id}'s full "
+                    f"post-move profile (CPU, memory, network, "
+                    f"cooling): {predicted_it_kw:.2f} kW IT power, "
+                    f"scaled to facility power by its current PUE "
+                    f"({target_pue:.2f}) -> {predicted_after_kw:.2f} kW. "
+                    "The source server is assumed to be powered down."
+                )
+
+                result["assumptions"].append(
+                    "The power model was trained on real data center "
+                    "telemetry (rescaled to this system's live IT-power "
+                    "range) -- its predicted relationship between load "
+                    "and power is a real one, but was learned from "
+                    "different servers than the ones being simulated "
+                    "here, so treat this as an informed estimate, not "
+                    "a measurement."
+                )
+
+            else:
+
+                result["assumptions"].append(
+                    f"Energy after = target facility power "
+                    f"({target_facility_power_kw:.2f} kW) × "
+                    f"post-move CPU ratio ({cpu_ratio:.2f}) -- the "
+                    "trained power model wasn't available for this "
+                    "target, so this simpler formula was used instead. "
+                    "The source server is assumed to be powered down."
+                )
 
             result["assumptions"].append(
                 f"Carbon = energy × "
@@ -982,74 +1090,14 @@ def calculate_what_if(
                 f"server's cooling type."
             )
 
-            result["assumptions"].append(
-                "The primary energy, carbon, cost and water "
-                "estimates are formula-based and do not depend "
-                "on the trained ML power model."
-            )
+            if used_model_for_estimate:
 
-            # =================================================
-            # TRAINED POWER MODEL — OPTIONAL REFERENCE ONLY
-            # =================================================
-
-            if (
-                power_model is not None
-                and target_cooling is not None
-            ):
-
-                target_pue = rules_engine.compute_pue(
-                    target_power.it_power_kw,
-                    target_power.facility_power_kw,
+                result[
+                    "model_predicted_target_it_power_kw"
+                ] = round(
+                    predicted_it_kw,
+                    2,
                 )
-
-                predicted_it_kw = _predict_power_kw(
-                    power_model,
-                    target,
-                    target_cooling,
-                    pue=target_pue,
-                    cpu_value=post_move_cpu,
-                    memory_value=post_move_memory,
-                    network_value=(
-                        target_telemetry.network_throughput_gbps
-                        or 0
-                    )
-                    +
-                    (
-                        source_telemetry.network_throughput_gbps
-                        or 0
-                    )
-                    * CONSOLIDATION_OVERHEAD_FACTOR,
-                    workload_value=min(
-                        1.0,
-                        (
-                            target_telemetry.workload_intensity
-                            or 0
-                        )
-                        +
-                        (
-                            source_telemetry.workload_intensity
-                            or 0
-                        )
-                        * CONSOLIDATION_OVERHEAD_FACTOR,
-                    ),
-                )
-
-                if predicted_it_kw is not None:
-
-                    result[
-                        "model_predicted_target_it_power_kw"
-                    ] = round(
-                        predicted_it_kw,
-                        2,
-                    )
-
-                    result["assumptions"].append(
-                        f"The trained power model additionally predicts "
-                        f"{predicted_it_kw:.2f} kW IT power for the target "
-                        "after consolidation. This model output is shown "
-                        "for transparency and is not used in the primary "
-                        "savings calculation."
-                    )
 
         else:
 

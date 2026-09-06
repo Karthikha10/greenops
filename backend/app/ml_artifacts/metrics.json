@@ -1,6 +1,6 @@
 {
   "dataset_rows": 10000,
-  "dataset_columns": 15,
+  "dataset_columns": 16,
   "missing_values": {
     "datacenter_region": 3990
   },
@@ -48,18 +48,18 @@
     "selected_model": "LinearRegression",
     "results": {
       "LinearRegression": {
-        "MAE": 13.137,
-        "RMSE": 20.551,
+        "MAE": 0.211,
+        "RMSE": 0.33,
         "R2": 0.422
       },
       "RandomForest": {
-        "MAE": 14.149,
-        "RMSE": 21.539,
+        "MAE": 0.227,
+        "RMSE": 0.346,
         "R2": 0.366
       },
       "XGBoost": {
-        "MAE": 13.818,
-        "RMSE": 21.207,
+        "MAE": 0.222,
+        "RMSE": 0.341,
         "R2": 0.385
       }
     },
@@ -80,8 +80,14 @@
         "time_of_day"
       ]
     },
-    "target": "power_consumption_kw",
-    "note": "cpu_utilization IS included here since power, not CPU, is the target."
+    "target": "power_consumption_kw_rescaled",
+    "note": "cpu_utilization IS included here since power, not CPU, is the target. MAE/RMSE below are in rescaled kW (live IT-power scale), not the dataset's own kW scale -- see rescale below.",
+    "rescale": {
+      "kaggle_min_kw": 28.17,
+      "kaggle_max_kw": 233.63,
+      "live_min_kw": 1.2,
+      "live_max_kw": 4.5
+    }
   },
   "source": "Real 'Green AI Data Center Telemetry' dataset (Kaggle), 10,000 rows, as uploaded by the user -- not synthetic."
 }
