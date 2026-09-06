@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from . import models, rules_engine
+from . import forecasting, models, rules_engine
 
 
 # ------------------------------------------------------------
@@ -280,13 +280,23 @@ def _rank_consolidation_candidates(
 
     Candidates are same-type servers that aren't themselves idle.
 
-    Every candidate is checked for whether it can safely absorb
-    the source workload.
+    Every candidate is checked for whether it can safely absorb the source
+    workload, TWICE: once against its current snapshot, and once against
+    its own near-term forecast (forecasting.forecast_candidate_server()).
+
+    Why both: a target passing only the current-snapshot check can still be
+    a bad pick -- it might be about to get busy on its own, independent of
+    anything this system does, and the snapshot check has no way to see
+    that. A candidate only counts as safe when BOTH checks pass. When a
+    forecast isn't available yet (not enough history), the forecast check
+    is skipped rather than treated as a failure -- missing data shouldn't
+    block a recommendation that the current-state check already approved.
 
     Candidates are returned ranked:
 
         1. Safe candidates first
-        2. Lowest resulting utilization first
+        2. Lowest resulting utilization first (current vs. forecasted,
+           whichever is worse -- ranking conservatively)
 
     This allows the operator to see what was considered and why.
     """
@@ -351,17 +361,83 @@ def _rank_consolidation_candidates(
         )
 
         # ----------------------------------------------------
-        # Safety check
+        # Safety check -- current snapshot
         # ----------------------------------------------------
 
-        safe = (
+        safe_now = (
             post_move_cpu < SAFETY_LIMIT_PERCENT
             and post_move_memory < SAFETY_LIMIT_PERCENT
         )
 
-        headroom_used = max(
+        headroom_used_now = max(
             post_move_cpu,
             post_move_memory,
+        )
+
+        # ----------------------------------------------------
+        # Safety check -- candidate's own near-term forecast
+        #
+        # A target can look safe right now and still be a bad
+        # pick if it's about to get busy on its own -- the
+        # snapshot check above has no way to see that. This
+        # forecasts the candidate's OWN CPU/memory 15 minutes
+        # out (independent of the move), then adds the same
+        # source contribution used above.
+        # ----------------------------------------------------
+
+        forecast = forecasting.forecast_candidate_server(
+            db,
+            candidate.server_id,
+        )
+
+        forecast_available = bool(
+            forecast.get("eligible")
+            and forecast.get("predicted_cpu") is not None
+            and forecast.get("predicted_memory") is not None
+        )
+
+        if forecast_available:
+
+            forecast_post_move_cpu = (
+                forecast["predicted_cpu"]
+                + source_cpu * CONSOLIDATION_OVERHEAD_FACTOR
+            )
+
+            forecast_post_move_memory = (
+                forecast["predicted_memory"]
+                + source_memory * CONSOLIDATION_OVERHEAD_FACTOR
+            )
+
+            safe_forecast = (
+                forecast_post_move_cpu < SAFETY_LIMIT_PERCENT
+                and forecast_post_move_memory < SAFETY_LIMIT_PERCENT
+            )
+
+            headroom_used_forecast = max(
+                forecast_post_move_cpu,
+                forecast_post_move_memory,
+            )
+
+        else:
+
+            forecast_post_move_cpu = None
+            forecast_post_move_memory = None
+
+            # No forecast yet (not enough history) -- don't let
+            # missing data block a recommendation the snapshot
+            # check already approved.
+            safe_forecast = True
+            headroom_used_forecast = headroom_used_now
+
+        # A candidate only counts as safe when both checks agree.
+        safe = safe_now and safe_forecast
+
+        # Rank by whichever view is worse, so a candidate that
+        # looks fine now but risky soon doesn't outrank one that's
+        # genuinely safe on both counts.
+        headroom_used = max(
+            headroom_used_now,
+            headroom_used_forecast,
         )
 
         ranked.append({
@@ -373,6 +449,15 @@ def _rank_consolidation_candidates(
 
             "post_move_cpu": post_move_cpu,
             "post_move_memory": post_move_memory,
+
+            "safe_now": safe_now,
+
+            "forecast_available": forecast_available,
+            "forecast_predicted_cpu": forecast.get("predicted_cpu"),
+            "forecast_predicted_memory": forecast.get("predicted_memory"),
+            "forecast_post_move_cpu": forecast_post_move_cpu,
+            "forecast_post_move_memory": forecast_post_move_memory,
+            "safe_forecast": safe_forecast,
 
             "safe": safe,
             "headroom_used": headroom_used,
@@ -569,6 +654,9 @@ def calculate_what_if(
                 "server_id": c["server"].server_id,
 
                 "safe": c["safe"],
+                "safe_now": c["safe_now"],
+                "safe_forecast": c["safe_forecast"],
+                "forecast_available": c["forecast_available"],
 
                 "current_cpu": round(
                     c["current_cpu"],
@@ -588,6 +676,30 @@ def calculate_what_if(
                 "post_move_memory": round(
                     c["post_move_memory"],
                     2,
+                ),
+
+                "forecast_predicted_cpu": (
+                    round(c["forecast_predicted_cpu"], 2)
+                    if c["forecast_predicted_cpu"] is not None
+                    else None
+                ),
+
+                "forecast_predicted_memory": (
+                    round(c["forecast_predicted_memory"], 2)
+                    if c["forecast_predicted_memory"] is not None
+                    else None
+                ),
+
+                "forecast_post_move_cpu": (
+                    round(c["forecast_post_move_cpu"], 2)
+                    if c["forecast_post_move_cpu"] is not None
+                    else None
+                ),
+
+                "forecast_post_move_memory": (
+                    round(c["forecast_post_move_memory"], 2)
+                    if c["forecast_post_move_memory"] is not None
+                    else None
                 ),
             }
 
@@ -611,12 +723,29 @@ def calculate_what_if(
 
             if ranked:
 
+                rejected_only_by_forecast = sum(
+                    1
+                    for c in ranked
+                    if c["safe_now"] and not c["safe_forecast"]
+                )
+
                 result["assumptions"].append(
                     f"{len(ranked)} same-type server(s) considered, "
                     f"but none has headroom to absorb this workload "
                     f"without crossing {SAFETY_LIMIT_PERCENT:.0f}% "
                     "CPU or memory -- rejected, not recommended to act on."
                 )
+
+                if rejected_only_by_forecast:
+
+                    result["assumptions"].append(
+                        f"{rejected_only_by_forecast} candidate(s) looked "
+                        "safe based on their CURRENT load, but were "
+                        "rejected because their own near-term forecast "
+                        f"shows them crossing {SAFETY_LIMIT_PERCENT:.0f}% "
+                        "on their own, independent of this move -- see "
+                        "each candidate's forecast columns above."
+                    )
 
             else:
 
@@ -645,6 +774,25 @@ def calculate_what_if(
         result["target_server_id"] = target.server_id
 
         result["safe"] = True
+
+        if best["forecast_available"]:
+
+            result["assumptions"].append(
+                f"{target.server_id}'s own near-term forecast (independent "
+                f"of this move) predicts {best['forecast_predicted_cpu']:.1f}% "
+                f"CPU / {best['forecast_predicted_memory']:.1f}% memory in "
+                f"{forecasting.FORECAST_HORIZON_MINUTES} minutes -- combined "
+                "with this workload, it would stay under the safety limit "
+                "on that basis too, not just right now."
+            )
+
+        else:
+
+            result["assumptions"].append(
+                f"{target.server_id} doesn't have enough history yet for a "
+                "near-term forecast -- this candidate was judged on its "
+                "current snapshot only."
+            )
 
         # Risk score:
         # 0 = very low utilization relative to safety limit

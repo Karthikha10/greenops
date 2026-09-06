@@ -331,7 +331,30 @@ the same 6h rule the flags use. Trains a lagged-feature model (5/10/15/20min
 CPU lags + hour-of-day) from real timestamped telemetry once ≥30 samples
 exist; falls back to transparent trend extrapolation until then, and says so
 (`"model_ready": false`) rather than pretending. Endpoint:
-`GET /servers/{id}/forecast`.
+`GET /servers/{id}/forecast`. **Only `horizon_minutes=15` actually uses the
+trained model** — 30/60 (both offered in the Server Detail dropdown) always
+fall back to `trend_forecast()` extrapolation, silently. Not a bug, just a
+real limitation worth knowing about: `FORECAST_HORIZON_MINUTES = 15` is the
+only horizon the model was trained for.
+
+**Target-candidate forecasting** (`forecasting.forecast_candidate_server()`)
+— a second, separate forecasting path with the mirror-image eligibility
+rule from the one above: `forecast_server()` only runs on already-idle
+servers ("will this idle server stay idle"); this one runs on *any*
+registered server with enough telemetry, specifically because a
+consolidation TARGET is by definition not idle and could never pass the
+other function's gate. **This does not require a separate trained model**
+— `build_feature_rows()` was never restricted to idle servers in the first
+place, so the exact same CPU model already generalizes to busy servers; the
+"idle only" restriction was purely `forecast_server()`'s own inference-time
+rule, not a training-data limitation. What *is* new: a genuine **memory**
+forecast model (`workload_forecast_memory_model.joblib` /
+`forecast_memory_metrics.json`), trained identically to the CPU one (same
+features, same selection rule) but a separate file so each target's own
+MAE/RMSE/R² stays independently visible — the CPU model alone was never
+enough here, since the safety check needs both dimensions. Both are trained
+together in one `train_workload_forecast.py` run via `_train_one_target()`.
+Used by `_rank_consolidation_candidates()` below — not used anywhere else.
 
 **`recommendations.py`** — converts active flags into `Recommendation` rows
 (`idle_server`→consolidate, `stale_data`→archive, `duplicate_data`→dedupe,
@@ -346,7 +369,23 @@ exist; falls back to transparent trend extrapolation until then, and says so
    array (top 5) exposes this whole ranking, which is what
    `RecommendationDetail.jsx` renders as a table so an operator can see what
    else was considered, not just take the pick on faith.
-2. Both CPU and memory must stay under 75% for a candidate to count as safe.
+2. Both CPU and memory must stay under 75% for a candidate to count as safe
+   — checked **twice**: once against the candidate's current snapshot
+   (`safe_now`), and once against its own near-term forecast via
+   `forecasting.forecast_candidate_server()` (`safe_forecast` — the
+   candidate's own predicted CPU/memory 15 minutes out, independent of this
+   move, plus the same source contribution). A candidate only counts as
+   `safe` when both agree. **This closes a real gap**: a target can look
+   fine right now and still be a bad pick if it's about to get busy on its
+   own — the snapshot check alone has no way to see that. When a forecast
+   isn't available yet (not enough history for that specific candidate —
+   this can flip per-request on a live system near a data gap), the
+   forecast check is skipped rather than treated as a failure; missing data
+   shouldn't block a recommendation the snapshot check already approved.
+   Exposed per-candidate as `safe_now`/`safe_forecast`/`forecast_available`/
+   `forecast_predicted_cpu`/`forecast_predicted_memory`, and
+   `RecommendationDetail.jsx` shows a distinct "Risky soon" badge for a
+   candidate that passed the current check but failed the forecast one.
 3. The top-ranked **safe** candidate is the one actually used for the impact
    estimate below it; if none qualify, `"safe": false` with a stated reason
    — never silently approved.
@@ -583,6 +622,48 @@ re-verified live:**
     unavailable) — see "Phase 2 — what's actually built" → `recommendations.py`
     above for the full reasoning and the honest limits that remain even
     after this fix.
+18. **What-if's safety check only ever looked at a candidate target's
+    current snapshot** — a target passing the current-state check could
+    still be a bad pick if it was about to get busy on its own, and nothing
+    anywhere checked for that. Fixed by adding `forecast_candidate_server()`
+    (see "Phase 2" above) and running its prediction through the same
+    safety check, in addition to the current-state one — see point 2 under
+    `recommendations.py` above.
+19. **Running the project via `.claude/launch.json` silently used SQLite
+    instead of Postgres** — the "backend" preview config ran
+    `uvicorn app.main:app --port 8000 --app-dir backend` with no
+    `--env-file`, so `DATABASE_URL` was never loaded and `database.py`
+    fell back to its `sqlite:///./greenops.db` default. Telemetry still
+    flowed and the dashboard still looked correct (SQLAlchemy abstracts the
+    backend away, so nothing *looked* wrong) — it just wasn't writing to
+    `greenops_db` in Postgres as documented above. Caught by noticing a
+    direct DB query returned data from Sep 4-5 instead of the current
+    session. Fixed by adding `"--env-file", "backend/.env"` to that
+    config's `runtimeArgs` — note the path is relative to the **project
+    root**, not `backend/`, since `--app-dir` only changes Python's module
+    search path, not the process's actual working directory (same reason
+    the frontend config uses `npm --prefix frontend` instead of a `cwd`
+    field — there isn't one). **Always confirm which database a running
+    backend is actually using** before trusting anything queried through
+    it — check the startup log line ("Loading environment from...") or
+    query Postgres directly and compare row timestamps, don't assume.
+    **This bit twice in the same session**: right after fixing the backend
+    config above, `train_workload_forecast.py` was run from a bare
+    `python -m app.train_workload_forecast` in a fresh shell with no
+    `DATABASE_URL` set — same fallback, same silent wrong-database problem,
+    just via a direct script invocation instead of the launch config. It
+    trained a model that looked fine (real metrics, real R²) but was
+    learned from stale Sep 4-5 SQLite data, not the live Postgres telemetry
+    it would actually be applied to. Caught by checking the saved
+    `training_from`/`training_to` timestamps in `forecast_metrics.json`
+    against what Postgres actually has, and re-run with
+    `DATABASE_URL=postgresql://greenops_user:green123@localhost:5432/greenops_db`
+    set explicitly in front of the command. **The lesson generalizes past
+    this one config file**: any ad-hoc script or training run that imports
+    `app.database.SessionLocal` needs `DATABASE_URL` set in its own shell
+    environment — it does not inherit it from `.env` automatically the way
+    `uvicorn --env-file` does. Set it explicitly for every such command, not
+    just the one that starts the server.
 
 If something looks numerically "off" again, check for the same class of
 issue: an assumption about cadence/scale that isn't actually enforced

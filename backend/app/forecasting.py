@@ -30,6 +30,16 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "ml_artifacts")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 METRICS_PATH = os.path.join(MODEL_DIR, METRICS_FILENAME)
 
+# Memory forecast -- same lag-feature approach and training data as the CPU
+# forecast (train_workload_forecast.py trains both from the same samples),
+# kept as a separate model file/metrics rather than a multi-output model so
+# each target's own MAE/RMSE/R2 and selected algorithm stay independently
+# visible, same as the CPU/power model split in train_model.py.
+MEMORY_MODEL_FILENAME = "workload_forecast_memory_model.joblib"
+MEMORY_METRICS_FILENAME = "forecast_memory_metrics.json"
+MEMORY_MODEL_PATH = os.path.join(MODEL_DIR, MEMORY_MODEL_FILENAME)
+MEMORY_METRICS_PATH = os.path.join(MODEL_DIR, MEMORY_METRICS_FILENAME)
+
 FEATURE_COLUMNS = [
     "cpu_lag_5m",
     "cpu_lag_10m",
@@ -127,6 +137,9 @@ def build_feature_rows(rows: Iterable, horizon_minutes: int = FORECAST_HORIZON_M
                 "workload_intensity": float(current.workload_intensity or 0),
                 "network_throughput_gbps": float(current.network_throughput_gbps or 0),
                 "target_cpu": float(future.cpu_utilization),
+                "target_memory": float(future.memory_utilization)
+                if future.memory_utilization is not None
+                else None,
                 "server_id": current.server_id,
                 "timestamp": current.timestamp,
             })
@@ -173,12 +186,23 @@ def build_inference_features(rows: Iterable, as_of: Optional[datetime] = None) -
     return features
 
 
-def trend_forecast(rows: Iterable, horizon_minutes: int = FORECAST_HORIZON_MINUTES) -> dict:
-    """Transparent fallback used until enough live history exists for the model."""
+def trend_forecast(
+    rows: Iterable,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
+    field: str = "cpu_utilization",
+) -> dict:
+    """
+    Transparent fallback used until enough live history exists for the model.
+
+    `field` selects which telemetry column to extrapolate -- "cpu_utilization"
+    or "memory_utilization" -- since the same simple rate-of-change logic
+    applies to either.
+    """
     ordered = _as_sorted_rows(rows)
     if not ordered:
-        return {"predicted_cpu": None, "trend": "unknown", "reference_minutes": None}
+        return {"predicted_value": None, "trend": "unknown", "reference_minutes": None}
     current = ordered[-1]
+    current_value = getattr(current, field)
     timestamps = [row.timestamp for row in ordered]
     reference = _nearest_row(
         ordered,
@@ -188,16 +212,17 @@ def trend_forecast(rows: Iterable, horizon_minutes: int = FORECAST_HORIZON_MINUT
     )
     if reference is None or reference.timestamp == current.timestamp:
         return {
-            "predicted_cpu": round(float(current.cpu_utilization), 2),
+            "predicted_value": round(float(current_value), 2),
             "trend": "stable",
             "reference_minutes": None,
         }
+    reference_value = getattr(reference, field)
     elapsed_minutes = (current.timestamp - reference.timestamp).total_seconds() / 60
-    rate_per_minute = (current.cpu_utilization - reference.cpu_utilization) / elapsed_minutes
-    predicted = max(0.0, min(100.0, current.cpu_utilization + rate_per_minute * horizon_minutes))
+    rate_per_minute = (current_value - reference_value) / elapsed_minutes
+    predicted = max(0.0, min(100.0, current_value + rate_per_minute * horizon_minutes))
     trend = "rising" if rate_per_minute > 0.05 else "falling" if rate_per_minute < -0.05 else "stable"
     return {
-        "predicted_cpu": round(float(predicted), 2),
+        "predicted_value": round(float(predicted), 2),
         "trend": trend,
         "reference_minutes": round(elapsed_minutes, 1),
     }
@@ -250,6 +275,19 @@ def load_forecast_metrics() -> dict:
         return json.load(file)
 
 
+def load_forecast_memory_model():
+    if not os.path.exists(MEMORY_MODEL_PATH):
+        return None
+    return joblib.load(MEMORY_MODEL_PATH)
+
+
+def load_forecast_memory_metrics() -> dict:
+    if not os.path.exists(MEMORY_METRICS_PATH):
+        return {}
+    with open(MEMORY_METRICS_PATH) as file:
+        return json.load(file)
+
+
 def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_MINUTES) -> dict:
     eligibility = idle_eligibility(db, server_id)
     if not eligibility["eligible"]:
@@ -280,8 +318,8 @@ def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_
         model_version = metrics.get("model_version", "workload-forecast-v1")
         validation = metrics.get("selected_metrics", {})
     else:
-        fallback = trend_forecast(rows, horizon_minutes=horizon_minutes)
-        predicted_cpu = fallback["predicted_cpu"]
+        fallback = trend_forecast(rows, horizon_minutes=horizon_minutes, field="cpu_utilization")
+        predicted_cpu = fallback["predicted_value"]
         method = "trend_extrapolation"
         trend = fallback["trend"]
 
@@ -312,4 +350,94 @@ def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_
         "source_observations": len(rows),
         "generated_at": datetime.utcnow().isoformat(),
         "model_ready": model is not None and live_features is not None and horizon_minutes == FORECAST_HORIZON_MINUTES,
+    }
+
+
+def forecast_candidate_server(
+    db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_MINUTES
+) -> dict:
+    """
+    Forecast a consolidation TARGET candidate's own near-term CPU and memory.
+
+    forecast_server() above answers "will this already-idle server stay
+    idle" and is gated on idle_eligibility() -- a candidate target is by
+    definition NOT idle (that's what makes it a viable target), so it could
+    never pass that gate. This answers the mirror-image question instead:
+    "will this busy-but-not-full server still have headroom soon," with no
+    idle gate at all -- any registered server with enough telemetry history
+    is eligible here.
+
+    Reuses the exact same trained CPU model as forecast_server(): the
+    training data in build_feature_rows() was never restricted to idle
+    servers in the first place, so the same model already generalizes to
+    busy servers. Memory uses its own model trained the same way (see
+    train_workload_forecast.py) since the CPU model only ever predicted CPU.
+
+    Returns predicted CPU and memory 15 minutes out. Used by
+    recommendations.py's candidate safety check to catch a target that
+    looks safe RIGHT NOW but is about to get busy on its own, before any
+    workload is even moved onto it.
+    """
+    server = db.query(models.Server).filter(models.Server.server_id == server_id).first()
+    if server is None:
+        return {"eligible": False, "reason": "Server is not registered."}
+
+    rows = (
+        db.query(models.ServerTelemetry)
+        .filter(models.ServerTelemetry.server_id == server_id)
+        .order_by(models.ServerTelemetry.timestamp.asc())
+        .all()
+    )
+    if not rows:
+        return {"eligible": False, "reason": "No telemetry available for this candidate."}
+
+    current = rows[-1]
+    live_features = build_inference_features(rows)
+    use_model = live_features is not None and horizon_minutes == FORECAST_HORIZON_MINUTES
+
+    cpu_model = load_forecast_model() if use_model else None
+    memory_model = load_forecast_memory_model() if use_model else None
+    cpu_metrics = load_forecast_metrics()
+    memory_metrics = load_forecast_memory_metrics()
+
+    if cpu_model is not None:
+        predicted_cpu = float(
+            cpu_model.predict([[live_features[column] for column in FEATURE_COLUMNS]])[0]
+        )
+        predicted_cpu = max(0.0, min(100.0, predicted_cpu))
+        cpu_method = cpu_metrics.get("selected_model", "lagged_model")
+    else:
+        fallback = trend_forecast(rows, horizon_minutes=horizon_minutes, field="cpu_utilization")
+        predicted_cpu = fallback["predicted_value"]
+        cpu_method = "trend_extrapolation"
+
+    if memory_model is not None:
+        predicted_memory = float(
+            memory_model.predict([[live_features[column] for column in FEATURE_COLUMNS]])[0]
+        )
+        predicted_memory = max(0.0, min(100.0, predicted_memory))
+        memory_method = memory_metrics.get("selected_model", "lagged_model")
+    else:
+        fallback = trend_forecast(rows, horizon_minutes=horizon_minutes, field="memory_utilization")
+        predicted_memory = fallback["predicted_value"]
+        memory_method = "trend_extrapolation"
+
+    if predicted_cpu is None or predicted_memory is None:
+        return {
+            "eligible": False,
+            "reason": "Not enough history yet to forecast this candidate.",
+        }
+
+    return {
+        "server_id": server_id,
+        "eligible": True,
+        "horizon_minutes": horizon_minutes,
+        "measured_cpu": round(float(current.cpu_utilization), 2),
+        "predicted_cpu": round(float(predicted_cpu), 2),
+        "measured_memory": round(float(current.memory_utilization), 2),
+        "predicted_memory": round(float(predicted_memory), 2),
+        "cpu_method": cpu_method,
+        "memory_method": memory_method,
+        "model_ready": cpu_model is not None and memory_model is not None,
+        "source_observations": len(rows),
     }

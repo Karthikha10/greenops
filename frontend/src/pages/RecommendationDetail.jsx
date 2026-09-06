@@ -49,16 +49,29 @@ function formatValue(value, suffix = "") {
 
 function candidateReason(candidate, isSelected) {
   if (isSelected) {
-    return (
-      "Selected because it is the highest-ranked safe target " +
-      "with the most remaining CPU/memory headroom."
-    );
+    return candidate.forecast_available
+      ? "Selected because it is the highest-ranked safe target " +
+          "with the most remaining CPU/memory headroom, now and by " +
+          "its own near-term forecast."
+      : "Selected because it is the highest-ranked safe target " +
+          "with the most remaining CPU/memory headroom, based on its " +
+          "current load -- not enough history yet for a near-term " +
+          "forecast on this candidate.";
   }
 
   if (candidate.safe) {
     return (
       "Safe target, but ranked below the selected server because " +
       "it leaves less headroom after the workload move."
+    );
+  }
+
+  if (candidate.safe_now && !candidate.safe_forecast) {
+    return (
+      "Looks safe right now, but this server's own near-term " +
+      `forecast (independent of this move) predicts ${candidate.forecast_predicted_cpu}% CPU / ` +
+      `${candidate.forecast_predicted_memory}% memory soon -- combined with this workload, that ` +
+      "would cross the 75% safety limit, so it's rejected."
     );
   }
 
@@ -442,11 +455,15 @@ export default function RecommendationDetail() {
                               className={`badge ${
                                 c.safe
                                   ? "good"
+                                  : c.safe_now && !c.safe_forecast
+                                  ? "warn"
                                   : "danger"
                               }`}
                             >
                               {c.safe
                                 ? "Safe"
+                                : c.safe_now && !c.safe_forecast
+                                ? "Risky soon"
                                 : "Over limit"}
                             </span>
 
@@ -549,7 +566,14 @@ export default function RecommendationDetail() {
               A target is considered safe only when
               both CPU and memory remain below{" "}
               <strong>75%</strong> after the workload
-              move.
+              move -- checked twice: once against the
+              target's current load, and once against
+              its own 15-minute forecast (independent
+              of this move). A candidate marked{" "}
+              <strong>Risky soon</strong> passed the
+              current check but is predicted to get
+              busy on its own soon enough to cross the
+              limit anyway.
 
             </div>
           )}

@@ -75,19 +75,10 @@ def candidate_models() -> dict:
     return candidates
 
 
-def train_from_database(db: Session) -> dict:
-    rows = db.query(models.ServerTelemetry).order_by(models.ServerTelemetry.timestamp.asc()).all()
-    samples = forecasting.build_feature_rows(rows)
-    if len(samples) < MIN_SAMPLES:
-        raise RuntimeError(
-            f"Only {len(samples)} lagged samples are available. "
-            f"Accumulate at least {MIN_SAMPLES} timestamped samples with 15-minute future targets "
-            "by running the server simulator, then train again."
-        )
-
-    frame = pd.DataFrame(samples).sort_values("timestamp")
+def _train_one_target(frame: pd.DataFrame, target_column: str, target_label: str,
+                       model_path: str, metrics_path: str, source_rows: int) -> dict:
     X = frame[forecasting.FEATURE_COLUMNS]
-    y = frame["target_cpu"]
+    y = frame[target_column]
 
     # Chronological holdout: the newest 20% is test data, so the evaluation
     # resembles forecasting the future rather than randomly mixing time.
@@ -111,7 +102,7 @@ def train_from_database(db: Session) -> dict:
 
     winner = select_winner(results)
     os.makedirs(forecasting.MODEL_DIR, exist_ok=True)
-    joblib.dump(fitted[winner], forecasting.MODEL_PATH)
+    joblib.dump(fitted[winner], model_path)
 
     metadata = {
         "model_version": MODEL_VERSION,
@@ -119,10 +110,10 @@ def train_from_database(db: Session) -> dict:
         "selected_metrics": results[winner],
         "all_results": results,
         "feature_columns": forecasting.FEATURE_COLUMNS,
-        "target": "cpu_utilization at 15 minutes in the future",
+        "target": f"{target_label} at 15 minutes in the future",
         "horizon_minutes": forecasting.FORECAST_HORIZON_MINUTES,
-        "source_rows": len(rows),
-        "training_samples": len(samples),
+        "source_rows": source_rows,
+        "training_samples": len(frame),
         "train_samples": len(X_train),
         "test_samples": len(X_test),
         "training_from": frame["timestamp"].min().isoformat(),
@@ -131,10 +122,42 @@ def train_from_database(db: Session) -> dict:
         "selection_rule": "A complex model must beat Linear Regression by more than 5% relative MAE to be selected.",
         "limitation": "Forecast continues observed patterns; it cannot anticipate one-off traffic spikes or failures.",
     }
-    with open(forecasting.METRICS_PATH, "w") as file:
+    with open(metrics_path, "w") as file:
         json.dump(metadata, file, indent=2)
 
     return metadata
+
+
+def train_from_database(db: Session) -> dict:
+    rows = db.query(models.ServerTelemetry).order_by(models.ServerTelemetry.timestamp.asc()).all()
+    samples = forecasting.build_feature_rows(rows)
+    if len(samples) < MIN_SAMPLES:
+        raise RuntimeError(
+            f"Only {len(samples)} lagged samples are available. "
+            f"Accumulate at least {MIN_SAMPLES} timestamped samples with 15-minute future targets "
+            "by running the server simulator, then train again."
+        )
+
+    frame = pd.DataFrame(samples).sort_values("timestamp")
+
+    # CPU forecast -- feeds Server Detail's "will this idle server stay idle" check.
+    cpu_metadata = _train_one_target(
+        frame, "target_cpu", "cpu_utilization",
+        forecasting.MODEL_PATH, forecasting.METRICS_PATH, len(rows),
+    )
+
+    # Memory forecast -- same features and training data, different target.
+    # Needed by the consolidation what-if safety check, which has to know
+    # about a candidate TARGET's near-term memory headroom too, not just CPU.
+    memory_frame = frame.dropna(subset=["target_memory"])
+    memory_metadata = None
+    if len(memory_frame) >= MIN_SAMPLES:
+        memory_metadata = _train_one_target(
+            memory_frame, "target_memory", "memory_utilization",
+            forecasting.MEMORY_MODEL_PATH, forecasting.MEMORY_METRICS_PATH, len(rows),
+        )
+
+    return {"cpu_model": cpu_metadata, "memory_model": memory_metadata}
 
 
 def main():
@@ -144,6 +167,14 @@ def main():
         print(json.dumps(metadata, indent=2))
         print(f"Saved {forecasting.MODEL_PATH}")
         print(f"Saved {forecasting.METRICS_PATH}")
+        if metadata["memory_model"] is not None:
+            print(f"Saved {forecasting.MEMORY_MODEL_PATH}")
+            print(f"Saved {forecasting.MEMORY_METRICS_PATH}")
+        else:
+            print(
+                "Memory model skipped -- not enough samples with a valid "
+                "future memory reading yet."
+            )
     finally:
         db.close()
 

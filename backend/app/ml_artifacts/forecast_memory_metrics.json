@@ -2,25 +2,25 @@
   "model_version": "workload-forecast-v1",
   "selected_model": "LinearRegression",
   "selected_metrics": {
-    "MAE": 6.364,
-    "RMSE": 8.189,
-    "R2": 0.898
+    "MAE": 6.028,
+    "RMSE": 7.801,
+    "R2": 0.879
   },
   "all_results": {
     "LinearRegression": {
-      "MAE": 6.364,
-      "RMSE": 8.189,
-      "R2": 0.898
+      "MAE": 6.028,
+      "RMSE": 7.801,
+      "R2": 0.879
     },
     "RandomForest": {
-      "MAE": 6.209,
-      "RMSE": 8.711,
-      "R2": 0.885
+      "MAE": 6.053,
+      "RMSE": 8.172,
+      "R2": 0.867
     },
     "XGBoost": {
-      "MAE": 7.21,
-      "RMSE": 9.673,
-      "R2": 0.858
+      "MAE": 6.079,
+      "RMSE": 8.246,
+      "R2": 0.865
     }
   },
   "feature_columns": [
@@ -35,7 +35,7 @@
     "hour_sin",
     "hour_cos"
   ],
-  "target": "cpu_utilization at 15 minutes in the future",
+  "target": "memory_utilization at 15 minutes in the future",
   "horizon_minutes": 15,
   "source_rows": 1032,
   "training_samples": 444,
@@ -43,7 +43,7 @@
   "test_samples": 89,
   "training_from": "2026-09-05T07:55:28.228270",
   "training_to": "2026-09-05T08:28:52.708451",
-  "trained_at": "2026-09-06T12:30:54.644478",
+  "trained_at": "2026-09-06T12:30:54.915427",
   "selection_rule": "A complex model must beat Linear Regression by more than 5% relative MAE to be selected.",
   "limitation": "Forecast continues observed patterns; it cannot anticipate one-off traffic spikes or failures."
 }
