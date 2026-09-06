@@ -46,7 +46,7 @@ RECOMMENDATION_MAP = {
 
 
 # ------------------------------------------------------------
-# Priority (severity-derived label, unchanged -- still shown on the card)
+# Priority
 # ------------------------------------------------------------
 
 PRIORITY_RANK = {
@@ -83,9 +83,11 @@ def sync_recommendations(db: Session):
     """
     Convert every active Flag into a Recommendation.
 
-    Existing recommendations are updated instead of duplicated. A snoozed
-    recommendation whose snooze window has passed is reopened as pending so
-    the underlying waste isn't silently forgotten.
+    Existing recommendations are updated instead of duplicated.
+
+    A snoozed recommendation whose snooze window has passed is
+    reopened as pending so the underlying waste isn't silently
+    forgotten.
     """
 
     active_flags = (
@@ -126,14 +128,18 @@ def sync_recommendations(db: Session):
             recommendation.title = mapping["title"]
             recommendation.explanation = explanation
 
-            # A snooze that has expired reopens as pending. Accepted/rejected
-            # decisions, and snoozes still in their window, are left alone.
             if recommendation.status == "snoozed" and (
-                recommendation.snoozed_until is None or recommendation.snoozed_until <= now
+                recommendation.snoozed_until is None
+                or recommendation.snoozed_until <= now
             ):
                 recommendation.status = "pending"
                 recommendation.snoozed_until = None
-            elif recommendation.status not in ("accepted", "rejected", "snoozed"):
+
+            elif recommendation.status not in (
+                "accepted",
+                "rejected",
+                "snoozed",
+            ):
                 recommendation.status = "pending"
 
             updated += 1
@@ -153,14 +159,8 @@ def sync_recommendations(db: Session):
             db.add(recommendation)
             created += 1
 
-    # _upsert_flag() creates a NEW Flag row (new id) whenever a condition
-    # re-triggers after previously resolving -- so a server that flips
-    # idle/healthy/idle repeatedly ends up with several Flag rows over time,
-    # only the newest of which is active. Without this pass, the OLDER
-    # recommendations (tied to now-resolved flags) never got cleaned up and
-    # piled up as stale duplicates for the same server. Withdraw any pending
-    # recommendation whose flag is no longer active.
     active_flag_ids = [flag.id for flag in active_flags]
+
     withdrawn = (
         db.query(models.Recommendation)
         .filter(
@@ -169,6 +169,7 @@ def sync_recommendations(db: Session):
         )
         .all()
     )
+
     for recommendation in withdrawn:
         recommendation.status = "withdrawn"
 
@@ -189,27 +190,18 @@ TARIFF_PER_KWH = 8.0
 
 CARBON_INTENSITY_KG_PER_KWH = 0.5
 
-# How much of the source server's load a target absorbs when workload is
-# actually moved. Real migrations rarely add load 1:1 -- some of it is
-# eliminated (deduped connections, shared caches) -- so this sits inside the
-# 0.85-0.95 range from the roadmap rather than assuming a full 1:1 transfer.
 CONSOLIDATION_OVERHEAD_FACTOR = 0.9
 
-# A candidate target must stay under this utilization after absorbing the
-# source's load, on both CPU and memory, to be considered safe. Network
-# throughput is reported for context but NOT used as a hard safety gate --
-# there's no declared per-server network capacity anywhere in the schema, so
-# inventing a cap to check against would be less honest than leaving it out.
 SAFETY_LIMIT_PERCENT = 75.0
 
-# Storage-only actions (archive/deduplicate/rightsize) don't have a target
-# server or a power effect to model, so they carry a small fixed risk
-# instead of a computed one -- freeing storage doesn't touch a running
-# workload the way moving one does.
 STORAGE_ACTION_RISK = 0.1
 
 
 def _latest(db: Session, model, server_id: str):
+    """
+    Return the latest telemetry row for a server.
+    """
+
     return (
         db.query(model)
         .filter(model.server_id == server_id)
@@ -219,20 +211,45 @@ def _latest(db: Session, model, server_id: str):
 
 
 def _actively_idle_server_ids(db: Session) -> set:
-    """Servers currently carrying an unresolved idle_server flag -- never a
-    valid consolidation target, since they're the same kind of waste."""
+    """
+    Servers currently carrying an unresolved idle_server flag.
+
+    These are never valid consolidation targets because they
+    are themselves candidates for consolidation.
+    """
+
     rows = (
         db.query(models.Flag.server_id)
-        .filter(models.Flag.flag_type == "idle_server", models.Flag.resolved == 0)
+        .filter(
+            models.Flag.flag_type == "idle_server",
+            models.Flag.resolved == 0,
+        )
         .all()
     )
+
     return {row[0] for row in rows}
 
 
-def _predict_power_kw(power_model, server_meta, cooling, pue, cpu_value, memory_value, network_value, workload_value):
-    """Reuse the trained power model exactly as /servers/{id}/prediction does."""
+def _predict_power_kw(
+    power_model,
+    server_meta,
+    cooling,
+    pue,
+    cpu_value,
+    memory_value,
+    network_value,
+    workload_value,
+):
+    """
+    Reuse the trained power model exactly as /servers/{id}/prediction does.
+
+    This prediction is provided only as an additional transparent model
+    output. It is NOT used for the primary consolidation impact calculation.
+    """
+
     if power_model is None or cooling is None:
         return None
+
     features = pd.DataFrame([{
         "workload_intensity": workload_value,
         "memory_utilization": memory_value,
@@ -246,18 +263,33 @@ def _predict_power_kw(power_model, server_meta, cooling, pue, cpu_value, memory_
         "time_of_day": "Peak",
         "cpu_utilization": cpu_value,
     }])
-    return float(power_model.predict(features)[0])
+
+    return float(
+        power_model.predict(features)[0]
+    )
 
 
-def _rank_consolidation_candidates(db: Session, source_server, source_telemetry):
+def _rank_consolidation_candidates(
+    db: Session,
+    source_server,
+    source_telemetry,
+):
     """
-    Implements the roadmap's what-if algorithm: candidates are same-type
-    servers that aren't themselves idle; each is checked for whether it can
-    safely absorb the source's load. Returns EVERY candidate considered,
-    ranked safe-first then by most headroom left afterward -- not just the
-    single winner -- so an operator can see what else was considered and
-    why one candidate beat the others, not just take the answer on faith.
+    Implements the what-if consolidation algorithm.
+
+    Candidates are same-type servers that aren't themselves idle.
+
+    Every candidate is checked for whether it can safely absorb
+    the source workload.
+
+    Candidates are returned ranked:
+
+        1. Safe candidates first
+        2. Lowest resulting utilization first
+
+    This allows the operator to see what was considered and why.
     """
+
     idle_ids = _actively_idle_server_ids(db)
 
     candidates = (
@@ -270,39 +302,145 @@ def _rank_consolidation_candidates(db: Session, source_server, source_telemetry)
     )
 
     ranked = []
-    for candidate in candidates:
-        if candidate.server_id in idle_ids:
-            continue  # already flagged as its own kind of waste -- never a valid target
 
-        target_telemetry = _latest(db, models.ServerTelemetry, candidate.server_id)
+    for candidate in candidates:
+
+        # Never move workload onto another server that is
+        # itself currently flagged as idle.
+        if candidate.server_id in idle_ids:
+            continue
+
+        target_telemetry = _latest(
+            db,
+            models.ServerTelemetry,
+            candidate.server_id,
+        )
+
         if target_telemetry is None:
             continue
 
-        post_move_cpu = target_telemetry.cpu_utilization + source_telemetry.cpu_utilization * CONSOLIDATION_OVERHEAD_FACTOR
-        post_move_memory = target_telemetry.memory_utilization + source_telemetry.memory_utilization * CONSOLIDATION_OVERHEAD_FACTOR
-        safe = post_move_cpu < SAFETY_LIMIT_PERCENT and post_move_memory < SAFETY_LIMIT_PERCENT
-        headroom_used = max(post_move_cpu, post_move_memory)
+        current_cpu = float(
+            target_telemetry.cpu_utilization or 0
+        )
+
+        current_memory = float(
+            target_telemetry.memory_utilization or 0
+        )
+
+        source_cpu = float(
+            source_telemetry.cpu_utilization or 0
+        )
+
+        source_memory = float(
+            source_telemetry.memory_utilization or 0
+        )
+
+        # ----------------------------------------------------
+        # Simulated post-move utilization
+        # ----------------------------------------------------
+
+        post_move_cpu = (
+            current_cpu
+            + source_cpu * CONSOLIDATION_OVERHEAD_FACTOR
+        )
+
+        post_move_memory = (
+            current_memory
+            + source_memory * CONSOLIDATION_OVERHEAD_FACTOR
+        )
+
+        # ----------------------------------------------------
+        # Safety check
+        # ----------------------------------------------------
+
+        safe = (
+            post_move_cpu < SAFETY_LIMIT_PERCENT
+            and post_move_memory < SAFETY_LIMIT_PERCENT
+        )
+
+        headroom_used = max(
+            post_move_cpu,
+            post_move_memory,
+        )
 
         ranked.append({
             "server": candidate,
             "telemetry": target_telemetry,
+
+            "current_cpu": current_cpu,
+            "current_memory": current_memory,
+
             "post_move_cpu": post_move_cpu,
             "post_move_memory": post_move_memory,
+
             "safe": safe,
             "headroom_used": headroom_used,
         })
 
-    # Safe candidates first (most headroom left = lowest resulting utilization
-    # = best), then unsafe ones after, for transparency about what was ruled out.
-    ranked.sort(key=lambda c: (not c["safe"], c["headroom_used"]))
+    ranked.sort(
+        key=lambda c: (
+            not c["safe"],
+            c["headroom_used"],
+        )
+    )
+
     return ranked
 
 
-def calculate_what_if(db: Session, recommendation, power_model=None):
+def calculate_what_if(
+    db: Session,
+    recommendation,
+    power_model=None,
+):
     """
-    Estimate the environmental and resource impact of applying a
-    recommendation. This is a decision-support estimate only -- no physical
-    infrastructure changes are performed.
+    Estimate the environmental and resource impact of applying
+    a recommendation.
+
+    This is a decision-support estimate only.
+    No physical infrastructure changes are performed.
+
+    For consolidation:
+
+        Energy Before
+            = source facility power
+            + target facility power
+
+        Energy After
+            = target facility power
+            × post-move CPU / current target CPU
+
+        Energy Saving
+            = energy before - energy after
+
+        Carbon Before
+            = energy before × carbon intensity
+
+        Carbon After
+            = energy after × carbon intensity
+
+        Carbon Reduction
+            = carbon before - carbon after
+
+        Cost Before
+            = energy before × tariff
+
+        Cost After
+            = energy after × tariff
+
+        Cost Saving
+            = cost before - cost after
+
+        Water Before
+            = energy before × water factor
+
+        Water After
+            = energy after × water factor
+
+        Water Saving
+            = water before - water after
+
+    These impact calculations are formula-based.
+    The ML power model is NOT required for them.
     """
 
     server_id = recommendation.server_id
@@ -312,165 +450,676 @@ def calculate_what_if(db: Session, recommendation, power_model=None):
         "server_id": server_id,
         "action": recommendation.recommendation_type,
 
+        # ----------------------------------------------------
+        # Savings
+        # ----------------------------------------------------
+
         "estimated_energy_saving_kwh": 0.0,
         "estimated_carbon_reduction_kg": 0.0,
         "estimated_cost_saving": 0.0,
+        "estimated_water_saving_l": 0.0,
         "estimated_storage_reclaimed_gb": 0.0,
 
+        # ----------------------------------------------------
+        # Before / After values
+        # ----------------------------------------------------
+
+        "estimated_energy_before_kwh": None,
+        "estimated_energy_after_kwh": None,
+
+        "estimated_carbon_before_kg": None,
+        "estimated_carbon_after_kg": None,
+
+        "estimated_cost_before": None,
+        "estimated_cost_after": None,
+
+        "estimated_water_before_l": None,
+        "estimated_water_after_l": None,
+
+        # ----------------------------------------------------
+        # Consolidation target
+        # ----------------------------------------------------
+
         "target_server_id": None,
+
+        # ----------------------------------------------------
+        # Safety
+        # ----------------------------------------------------
+
         "safe": None,
         "risk_score": None,
+
+        # ----------------------------------------------------
+        # Explanation
+        # ----------------------------------------------------
 
         "assumptions": [],
     }
 
     # ========================================================
-    # CONSOLIDATION -- real target-candidate simulation
+    # CONSOLIDATION
     # ========================================================
 
     if recommendation.recommendation_type == "consolidate":
 
-        source_server = db.query(models.Server).filter(models.Server.server_id == server_id).first()
-        source_telemetry = _latest(db, models.ServerTelemetry, server_id)
-        source_power = _latest(db, models.PowerTelemetry, server_id)
+        source_server = (
+            db.query(models.Server)
+            .filter(
+                models.Server.server_id == server_id
+            )
+            .first()
+        )
+
+        source_telemetry = _latest(
+            db,
+            models.ServerTelemetry,
+            server_id,
+        )
+
+        source_power = _latest(
+            db,
+            models.PowerTelemetry,
+            server_id,
+        )
+
+        # ----------------------------------------------------
+        # Validate source data
+        # ----------------------------------------------------
 
         if source_server is None or source_telemetry is None:
+
             result["safe"] = False
-            result["assumptions"].append("Not enough telemetry for this server to evaluate a move.")
+
+            result["assumptions"].append(
+                "Not enough telemetry for this server to evaluate a move."
+            )
+
             return result
 
-        ranked = _rank_consolidation_candidates(db, source_server, source_telemetry)
+        # ----------------------------------------------------
+        # Find and rank target candidates
+        # ----------------------------------------------------
 
-        # Expose every candidate considered, not just the winner -- ranked
-        # safe-first then by headroom, capped to a reasonable number to show.
+        ranked = _rank_consolidation_candidates(
+            db,
+            source_server,
+            source_telemetry,
+        )
+
+        # ----------------------------------------------------
+        # Expose candidates to frontend
+        # ----------------------------------------------------
+
         result["candidates"] = [
             {
                 "server_id": c["server"].server_id,
+
                 "safe": c["safe"],
-                "post_move_cpu": round(c["post_move_cpu"], 2),
-                "post_move_memory": round(c["post_move_memory"], 2),
+
+                "current_cpu": round(
+                    c["current_cpu"],
+                    2,
+                ),
+
+                "current_memory": round(
+                    c["current_memory"],
+                    2,
+                ),
+
+                "post_move_cpu": round(
+                    c["post_move_cpu"],
+                    2,
+                ),
+
+                "post_move_memory": round(
+                    c["post_move_memory"],
+                    2,
+                ),
             }
+
             for c in ranked[:5]
         ]
 
-        safe_candidates = [c for c in ranked if c["safe"]]
+        safe_candidates = [
+            c
+            for c in ranked
+            if c["safe"]
+        ]
+
+        # ----------------------------------------------------
+        # No safe candidate
+        # ----------------------------------------------------
 
         if not safe_candidates:
+
             result["safe"] = False
             result["risk_score"] = 1.0
+
             if ranked:
+
                 result["assumptions"].append(
-                    f"{len(ranked)} same-type server(s) considered, but none has headroom to absorb "
-                    f"this workload without crossing {SAFETY_LIMIT_PERCENT:.0f}% CPU or memory -- "
-                    "rejected, not recommended to act on."
+                    f"{len(ranked)} same-type server(s) considered, "
+                    f"but none has headroom to absorb this workload "
+                    f"without crossing {SAFETY_LIMIT_PERCENT:.0f}% "
+                    "CPU or memory -- rejected, not recommended to act on."
                 )
+
             else:
+
                 result["assumptions"].append(
-                    f"No other {source_server.server_type} server exists to evaluate as a target -- "
-                    "rejected, not recommended to act on."
+                    f"No other {source_server.server_type} server exists "
+                    "to evaluate as a target -- rejected, not recommended "
+                    "to act on."
                 )
+
             return result
 
+        # ----------------------------------------------------
+        # Best safe candidate
+        # ----------------------------------------------------
+
         best = safe_candidates[0]
-        target, target_telemetry, post_move_cpu, post_move_memory = (
-            best["server"], best["telemetry"], best["post_move_cpu"], best["post_move_memory"],
-        )
+
+        target = best["server"]
+
+        target_telemetry = best["telemetry"]
+
+        post_move_cpu = best["post_move_cpu"]
+
+        post_move_memory = best["post_move_memory"]
 
         result["target_server_id"] = target.server_id
-        result["safe"] = True
-        result["risk_score"] = round(max(post_move_cpu, post_move_memory) / SAFETY_LIMIT_PERCENT, 2)
-        result["post_move_cpu"] = round(post_move_cpu, 2)
-        result["post_move_memory"] = round(post_move_memory, 2)
 
-        target_power = _latest(db, models.PowerTelemetry, target.server_id)
-        target_cooling = _latest(db, models.CoolingTelemetry, target.server_id)
+        result["safe"] = True
+
+        # Risk score:
+        # 0 = very low utilization relative to safety limit
+        # 1 = exactly at safety limit
+        result["risk_score"] = round(
+            max(
+                post_move_cpu,
+                post_move_memory,
+            )
+            / SAFETY_LIMIT_PERCENT,
+            2,
+        )
+
+        # ----------------------------------------------------
+        # Before → After utilization values
+        # ----------------------------------------------------
+
+        result["target_current_cpu"] = round(
+            best["current_cpu"],
+            2,
+        )
+
+        result["target_current_memory"] = round(
+            best["current_memory"],
+            2,
+        )
+
+        result["source_current_cpu"] = round(
+            float(
+                source_telemetry.cpu_utilization or 0
+            ),
+            2,
+        )
+
+        result["source_current_memory"] = round(
+            float(
+                source_telemetry.memory_utilization or 0
+            ),
+            2,
+        )
+
+        result["post_move_cpu"] = round(
+            post_move_cpu,
+            2,
+        )
+
+        result["post_move_memory"] = round(
+            post_move_memory,
+            2,
+        )
+
+        # ----------------------------------------------------
+        # Target power telemetry
+        # ----------------------------------------------------
+
+        target_power = _latest(
+            db,
+            models.PowerTelemetry,
+            target.server_id,
+        )
+
+        target_cooling = _latest(
+            db,
+            models.CoolingTelemetry,
+            target.server_id,
+        )
+
+        # ====================================================
+        # FORMULA-BASED ENVIRONMENTAL IMPACT
+        # ====================================================
 
         if source_power and target_power:
-            energy_before_kwh = float(source_power.facility_power_kw or 0) + float(target_power.facility_power_kw or 0)
 
-            # Primary estimate: scale the TARGET's own current facility power
-            # by its post-move CPU ratio. This stays on live telemetry's
-            # scale throughout. We deliberately do NOT feed the trained power
-            # model's raw output into this number -- that model was trained
-            # on the historical dataset (tens of kW per reading) and, exactly
-            # as documented on the Server Detail page, its absolute magnitude
-            # doesn't match live simulated telemetry (single-digit kW). Using
-            # it here would silently propagate that mismatch into a dollar
-            # figure instead of just showing it as a number to eyeball.
-            cpu_ratio = post_move_cpu / target_telemetry.cpu_utilization if target_telemetry.cpu_utilization else 1
-            predicted_after_kw = float(target_power.facility_power_kw or 0) * cpu_ratio
-            energy_saved = max(0.0, energy_before_kwh - predicted_after_kw)
-
-            result["estimated_energy_saving_kwh"] = round(energy_saved, 2)
-            result["estimated_carbon_reduction_kg"] = round(energy_saved * CARBON_INTENSITY_KG_PER_KWH, 2)
-            result["estimated_cost_saving"] = round(energy_saved * TARIFF_PER_KWH, 2)
-
-            water_factor = rules_engine.WUE_FACTORS.get(source_server.cooling_type, 0.5)
-            result["estimated_water_saving_l"] = round(energy_saved * water_factor, 2)
-
-            result["assumptions"].append(
-                f"Estimated over one hour: moving {server_id}'s load onto {target.server_id} "
-                f"(same type, {CONSOLIDATION_OVERHEAD_FACTOR}x overhead factor) would leave it at "
-                f"{post_move_cpu:.0f}% CPU / {post_move_memory:.0f}% memory -- under the "
-                f"{SAFETY_LIMIT_PERCENT:.0f}% safety limit."
-            )
-            result["assumptions"].append(
-                f"Energy saving scales {target.server_id}'s own current facility power "
-                f"({target_power.facility_power_kw:.2f} kW) by its post-move CPU ratio, "
-                "not the trained power model -- that model's absolute scale doesn't match "
-                "live simulated telemetry (see Model Eval / Server Detail for that gap)."
-            )
-            result["assumptions"].append(
-                f"Water saving assumes {server_id}'s cooling load ({source_server.cooling_type}, "
-                f"{water_factor} L/kWh) is freed along with its energy use."
+            source_facility_power_kw = float(
+                source_power.facility_power_kw or 0
             )
 
-            # Trained power model's own prediction, shown for transparency
-            # only -- never used in the estimate above, for the reason
-            # stated there.
-            if power_model is not None and target_cooling is not None:
-                target_pue = rules_engine.compute_pue(target_power.it_power_kw, target_power.facility_power_kw)
+            target_facility_power_kw = float(
+                target_power.facility_power_kw or 0
+            )
+
+            # ------------------------------------------------
+            # 1. ENERGY BEFORE
+            #
+            # Both source and target servers are currently
+            # running.
+            #
+            # Since the reporting period is one hour:
+            #
+            # kW × 1 hour = kWh
+            # ------------------------------------------------
+
+            energy_before_kwh = (
+                source_facility_power_kw
+                + target_facility_power_kw
+            )
+
+            # ------------------------------------------------
+            # 2. ENERGY AFTER
+            #
+            # Source server is assumed to be powered down
+            # after successful consolidation.
+            #
+            # The target's facility power is scaled according
+            # to its simulated CPU utilization increase.
+            #
+            # This is a transparent formula, not ML.
+            # ------------------------------------------------
+
+            current_target_cpu = float(
+                target_telemetry.cpu_utilization or 0
+            )
+
+            if current_target_cpu > 0:
+
+                cpu_ratio = (
+                    post_move_cpu
+                    / current_target_cpu
+                )
+
+            else:
+
+                cpu_ratio = 1.0
+
+            predicted_after_kw = (
+                target_facility_power_kw
+                * cpu_ratio
+            )
+
+            energy_after_kwh = max(
+                predicted_after_kw,
+                0.0,
+            )
+
+            # ------------------------------------------------
+            # 3. ENERGY SAVING
+            # ------------------------------------------------
+
+            energy_saved = max(
+                energy_before_kwh
+                - energy_after_kwh,
+                0.0,
+            )
+
+            result[
+                "estimated_energy_before_kwh"
+            ] = round(
+                energy_before_kwh,
+                2,
+            )
+
+            result[
+                "estimated_energy_after_kwh"
+            ] = round(
+                energy_after_kwh,
+                2,
+            )
+
+            result[
+                "estimated_energy_saving_kwh"
+            ] = round(
+                energy_saved,
+                2,
+            )
+
+            # ------------------------------------------------
+            # 4. CARBON BEFORE
+            # ------------------------------------------------
+
+            carbon_before_kg = (
+                energy_before_kwh
+                * CARBON_INTENSITY_KG_PER_KWH
+            )
+
+            # ------------------------------------------------
+            # 5. CARBON AFTER
+            # ------------------------------------------------
+
+            carbon_after_kg = (
+                energy_after_kwh
+                * CARBON_INTENSITY_KG_PER_KWH
+            )
+
+            # ------------------------------------------------
+            # 6. CARBON REDUCTION
+            # ------------------------------------------------
+
+            carbon_reduction_kg = max(
+                carbon_before_kg
+                - carbon_after_kg,
+                0.0,
+            )
+
+            result[
+                "estimated_carbon_before_kg"
+            ] = round(
+                carbon_before_kg,
+                2,
+            )
+
+            result[
+                "estimated_carbon_after_kg"
+            ] = round(
+                carbon_after_kg,
+                2,
+            )
+
+            result[
+                "estimated_carbon_reduction_kg"
+            ] = round(
+                carbon_reduction_kg,
+                2,
+            )
+
+            # ------------------------------------------------
+            # 7. COST BEFORE
+            # ------------------------------------------------
+
+            cost_before = (
+                energy_before_kwh
+                * TARIFF_PER_KWH
+            )
+
+            # ------------------------------------------------
+            # 8. COST AFTER
+            # ------------------------------------------------
+
+            cost_after = (
+                energy_after_kwh
+                * TARIFF_PER_KWH
+            )
+
+            # ------------------------------------------------
+            # 9. COST SAVING
+            # ------------------------------------------------
+
+            cost_saving = max(
+                cost_before
+                - cost_after,
+                0.0,
+            )
+
+            result[
+                "estimated_cost_before"
+            ] = round(
+                cost_before,
+                2,
+            )
+
+            result[
+                "estimated_cost_after"
+            ] = round(
+                cost_after,
+                2,
+            )
+
+            result[
+                "estimated_cost_saving"
+            ] = round(
+                cost_saving,
+                2,
+            )
+
+            # ------------------------------------------------
+            # 10. WATER BEFORE / AFTER
+            # ------------------------------------------------
+
+            water_factor = rules_engine.WUE_FACTORS.get(
+                source_server.cooling_type,
+                0.5,
+            )
+
+            water_before_l = (
+                energy_before_kwh
+                * water_factor
+            )
+
+            water_after_l = (
+                energy_after_kwh
+                * water_factor
+            )
+
+            water_saving_l = max(
+                water_before_l
+                - water_after_l,
+                0.0,
+            )
+
+            result[
+                "estimated_water_before_l"
+            ] = round(
+                water_before_l,
+                2,
+            )
+
+            result[
+                "estimated_water_after_l"
+            ] = round(
+                water_after_l,
+                2,
+            )
+
+            result[
+                "estimated_water_saving_l"
+            ] = round(
+                water_saving_l,
+                2,
+            )
+
+            # ------------------------------------------------
+            # Explain calculation
+            # ------------------------------------------------
+
+            result["assumptions"].append(
+                f"Estimated over one hour: moving {server_id}'s "
+                f"workload onto {target.server_id} would change "
+                f"the target from {best['current_cpu']:.1f}% CPU / "
+                f"{best['current_memory']:.1f}% memory to "
+                f"{post_move_cpu:.1f}% CPU / "
+                f"{post_move_memory:.1f}% memory."
+            )
+
+            result["assumptions"].append(
+                f"Energy before = source facility power "
+                f"({source_facility_power_kw:.2f} kW) + target "
+                f"facility power ({target_facility_power_kw:.2f} kW)."
+            )
+
+            result["assumptions"].append(
+                f"Energy after = target facility power "
+                f"({target_facility_power_kw:.2f} kW) × "
+                f"post-move CPU ratio ({cpu_ratio:.2f}). "
+                "The source server is assumed to be powered down."
+            )
+
+            result["assumptions"].append(
+                f"Carbon = energy × "
+                f"{CARBON_INTENSITY_KG_PER_KWH:.2f} kg CO₂/kWh."
+            )
+
+            result["assumptions"].append(
+                f"Electricity cost = energy × "
+                f"₹{TARIFF_PER_KWH:.2f}/kWh."
+            )
+
+            result["assumptions"].append(
+                f"Water = energy × "
+                f"{water_factor:.2f} L/kWh based on the source "
+                f"server's cooling type."
+            )
+
+            result["assumptions"].append(
+                "The primary energy, carbon, cost and water "
+                "estimates are formula-based and do not depend "
+                "on the trained ML power model."
+            )
+
+            # =================================================
+            # TRAINED POWER MODEL — OPTIONAL REFERENCE ONLY
+            # =================================================
+
+            if (
+                power_model is not None
+                and target_cooling is not None
+            ):
+
+                target_pue = rules_engine.compute_pue(
+                    target_power.it_power_kw,
+                    target_power.facility_power_kw,
+                )
+
                 predicted_it_kw = _predict_power_kw(
-                    power_model, target, target_cooling, pue=target_pue,
+                    power_model,
+                    target,
+                    target_cooling,
+                    pue=target_pue,
                     cpu_value=post_move_cpu,
                     memory_value=post_move_memory,
-                    network_value=(target_telemetry.network_throughput_gbps or 0)
-                    + (source_telemetry.network_throughput_gbps or 0) * CONSOLIDATION_OVERHEAD_FACTOR,
-                    workload_value=min(1.0, (target_telemetry.workload_intensity or 0)
-                                        + (source_telemetry.workload_intensity or 0) * CONSOLIDATION_OVERHEAD_FACTOR),
+                    network_value=(
+                        target_telemetry.network_throughput_gbps
+                        or 0
+                    )
+                    +
+                    (
+                        source_telemetry.network_throughput_gbps
+                        or 0
+                    )
+                    * CONSOLIDATION_OVERHEAD_FACTOR,
+                    workload_value=min(
+                        1.0,
+                        (
+                            target_telemetry.workload_intensity
+                            or 0
+                        )
+                        +
+                        (
+                            source_telemetry.workload_intensity
+                            or 0
+                        )
+                        * CONSOLIDATION_OVERHEAD_FACTOR,
+                    ),
                 )
+
                 if predicted_it_kw is not None:
-                    result["model_predicted_target_it_power_kw"] = round(predicted_it_kw, 2)
+
+                    result[
+                        "model_predicted_target_it_power_kw"
+                    ] = round(
+                        predicted_it_kw,
+                        2,
+                    )
+
+                    result["assumptions"].append(
+                        f"The trained power model additionally predicts "
+                        f"{predicted_it_kw:.2f} kW IT power for the target "
+                        "after consolidation. This model output is shown "
+                        "for transparency and is not used in the primary "
+                        "savings calculation."
+                    )
+
+        else:
+
+            result["assumptions"].append(
+                "Power telemetry is unavailable for the source or "
+                "target server, so energy, carbon, cost and water "
+                "impact cannot be estimated."
+            )
 
         return result
 
     # ========================================================
-    # RIGHTSIZING / ARCHIVE / DEDUPLICATE -- storage only, no target
+    # STORAGE ACTIONS
     # ========================================================
 
-    if recommendation.recommendation_type in ("rightsize", "archive", "deduplicate"):
+    if recommendation.recommendation_type in (
+        "rightsize",
+        "archive",
+        "deduplicate",
+    ):
 
         flag = (
             db.query(models.Flag)
-            .filter(models.Flag.id == recommendation.flag_id)
+            .filter(
+                models.Flag.id == recommendation.flag_id
+            )
             .first()
         )
 
         if flag:
-            reclaimable = float(flag.metric_value or 0)
-            result["estimated_storage_reclaimed_gb"] = round(reclaimable, 2)
+
+            reclaimable = float(
+                flag.metric_value or 0
+            )
+
+            result[
+                "estimated_storage_reclaimed_gb"
+            ] = round(
+                reclaimable,
+                2,
+            )
+
             result["risk_score"] = STORAGE_ACTION_RISK
+
             result["safe"] = True
 
             reason_by_type = {
-                "rightsize": "Estimated reclaimable capacity is based on allocated storage that is currently unused.",
-                "archive": "Estimated reclaimable storage is based on the stale-data volume identified by the rule engine.",
-                "deduplicate": "Estimated reclaimable storage is based on detected duplicate-data volume.",
+                "rightsize":
+                    "Estimated reclaimable capacity is based on "
+                    "allocated storage that is currently unused.",
+
+                "archive":
+                    "Estimated reclaimable storage is based on "
+                    "the stale-data volume identified by the rule engine.",
+
+                "deduplicate":
+                    "Estimated reclaimable storage is based on "
+                    "detected duplicate-data volume.",
             }
-            result["assumptions"].append(reason_by_type[recommendation.recommendation_type])
+
             result["assumptions"].append(
-                "No energy/carbon/water effect is modeled for storage-only actions -- freeing "
-                "capacity doesn't change a server's power draw in this system."
+                reason_by_type[
+                    recommendation.recommendation_type
+                ]
+            )
+
+            result["assumptions"].append(
+                "No energy/carbon/water effect is modeled for "
+                "storage-only actions -- freeing capacity doesn't "
+                "change a server's power draw in this system."
             )
 
         return result
@@ -483,73 +1132,193 @@ def calculate_what_if(db: Session, recommendation, power_model=None):
 # ------------------------------------------------------------
 
 def get_preferences(db: Session) -> models.Preferences:
-    prefs = db.query(models.Preferences).filter(models.Preferences.id == 1).first()
+
+    prefs = (
+        db.query(models.Preferences)
+        .filter(
+            models.Preferences.id == 1
+        )
+        .first()
+    )
+
     if prefs is None:
+
         prefs = models.Preferences(id=1)
+
         db.add(prefs)
         db.commit()
         db.refresh(prefs)
+
     return prefs
 
 
-def _normalize(value: float, max_value: float) -> float:
+def _normalize(
+    value: float,
+    max_value: float,
+) -> float:
+
     if not max_value or max_value <= 0:
         return 0.0
-    return max(0.0, min(1.0, value / max_value))
+
+    return max(
+        0.0,
+        min(
+            1.0,
+            value / max_value,
+        ),
+    )
 
 
-def rank_recommendations(rows_with_impact: list, preferences: models.Preferences) -> list:
-    """
-    Score each (recommendation, impact) pair using the org's configured
-    weights, normalizing each impact dimension against the max seen in this
-    batch so no single unit (kWh vs kg vs GB) silently dominates just
-    because its raw numbers happen to be larger.
-    """
-    max_energy = max((r["impact"]["estimated_energy_saving_kwh"] for r in rows_with_impact), default=0)
-    max_cost = max((r["impact"]["estimated_cost_saving"] for r in rows_with_impact), default=0)
-    max_carbon = max((r["impact"]["estimated_carbon_reduction_kg"] for r in rows_with_impact), default=0)
-    max_water = max((r["impact"].get("estimated_water_saving_l", 0) for r in rows_with_impact), default=0)
+def rank_recommendations(
+    rows_with_impact: list,
+    preferences: models.Preferences,
+) -> list:
+
+    max_energy = max(
+        (
+            r["impact"][
+                "estimated_energy_saving_kwh"
+            ]
+            for r in rows_with_impact
+        ),
+        default=0,
+    )
+
+    max_cost = max(
+        (
+            r["impact"][
+                "estimated_cost_saving"
+            ]
+            for r in rows_with_impact
+        ),
+        default=0,
+    )
+
+    max_carbon = max(
+        (
+            r["impact"][
+                "estimated_carbon_reduction_kg"
+            ]
+            for r in rows_with_impact
+        ),
+        default=0,
+    )
+
+    max_water = max(
+        (
+            r["impact"].get(
+                "estimated_water_saving_l",
+                0,
+            )
+            for r in rows_with_impact
+        ),
+        default=0,
+    )
 
     for entry in rows_with_impact:
+
         impact = entry["impact"]
+
         risk = impact.get("risk_score")
-        risk = 0.5 if risk is None else risk
+
+        risk = (
+            0.5
+            if risk is None
+            else risk
+        )
 
         score = (
-            preferences.energy_weight * _normalize(impact["estimated_energy_saving_kwh"], max_energy)
-            + preferences.cost_weight * _normalize(impact["estimated_cost_saving"], max_cost)
-            + preferences.carbon_weight * _normalize(impact["estimated_carbon_reduction_kg"], max_carbon)
-            + preferences.water_weight * _normalize(impact.get("estimated_water_saving_l", 0), max_water)
-            - preferences.risk_weight * risk
+            preferences.energy_weight
+            * _normalize(
+                impact[
+                    "estimated_energy_saving_kwh"
+                ],
+                max_energy,
+            )
+            +
+            preferences.cost_weight
+            * _normalize(
+                impact[
+                    "estimated_cost_saving"
+                ],
+                max_cost,
+            )
+            +
+            preferences.carbon_weight
+            * _normalize(
+                impact[
+                    "estimated_carbon_reduction_kg"
+                ],
+                max_carbon,
+            )
+            +
+            preferences.water_weight
+            * _normalize(
+                impact.get(
+                    "estimated_water_saving_l",
+                    0,
+                ),
+                max_water,
+            )
+            -
+            preferences.risk_weight
+            * risk
         )
-        entry["score"] = round(score, 3)
 
-    rows_with_impact.sort(key=lambda entry: entry["score"], reverse=True)
+        entry["score"] = round(
+            score,
+            3,
+        )
+
+    rows_with_impact.sort(
+        key=lambda entry: entry["score"],
+        reverse=True,
+    )
+
     return rows_with_impact
 
 
-def get_recommendations(db: Session, include_completed=False, power_model=None):
-    """
-    Returns pending (or all, if include_completed) recommendations with
-    their computed impact/risk/score attached, ordered by score.
-    """
+def get_recommendations(
+    db: Session,
+    include_completed=False,
+    power_model=None,
+):
 
     sync_recommendations(db)
 
-    query = db.query(models.Recommendation)
+    query = db.query(
+        models.Recommendation
+    )
 
     if not include_completed:
-        query = query.filter(models.Recommendation.status == "pending")
+
+        query = query.filter(
+            models.Recommendation.status == "pending"
+        )
 
     rows = query.all()
+
     preferences = get_preferences(db)
 
     enriched = []
-    for row in rows:
-        impact = calculate_what_if(db, row, power_model=power_model)
-        enriched.append({"recommendation": row, "impact": impact})
 
-    return rank_recommendations(enriched, preferences)
+    for row in rows:
+
+        impact = calculate_what_if(
+            db,
+            row,
+            power_model=power_model,
+        )
+
+        enriched.append({
+            "recommendation": row,
+            "impact": impact,
+        })
+
+    return rank_recommendations(
+        enriched,
+        preferences,
+    )
 
 
 # ------------------------------------------------------------
@@ -568,6 +1337,7 @@ def record_operator_action(
     Record the operator's decision on a recommendation.
 
     Supported operator actions:
+
         - consolidate
         - rightsize
         - snooze
@@ -585,50 +1355,98 @@ def record_operator_action(
     }
 
     if action not in valid_actions:
+
         raise ValueError(
             "Invalid operator action. "
             "Choose consolidate, rightsize, snooze, or do_nothing."
         )
 
     if action == "consolidate":
+
         if recommendation.recommendation_type != "consolidate":
-            raise ValueError("Consolidate action is only valid for consolidation recommendations.")
+
+            raise ValueError(
+                "Consolidate action is only valid for "
+                "consolidation recommendations."
+            )
+
         recommendation.status = "accepted"
+
         recommendation.decided_at = datetime.utcnow()
 
     elif action == "rightsize":
-        if recommendation.recommendation_type not in ("rightsize", "archive", "deduplicate"):
-            raise ValueError("Rightsize action is only valid for storage recommendations.")
+
+        if recommendation.recommendation_type not in (
+            "rightsize",
+            "archive",
+            "deduplicate",
+        ):
+
+            raise ValueError(
+                "Rightsize action is only valid for "
+                "storage recommendations."
+            )
+
         recommendation.status = "accepted"
+
         recommendation.decided_at = datetime.utcnow()
 
     elif action == "snooze":
+
         recommendation.status = "snoozed"
-        recommendation.snoozed_until = datetime.utcnow() + timedelta(hours=snooze_hours)
+
+        recommendation.snoozed_until = (
+            datetime.utcnow()
+            + timedelta(hours=snooze_hours)
+        )
 
     elif action == "do_nothing":
+
         recommendation.status = "rejected"
+
         recommendation.decided_at = datetime.utcnow()
 
-    # Snapshot the impact estimate at the moment of decision, so the
-    # decision log reflects what was actually shown to the operator.
-    impact = calculate_what_if(db, recommendation, power_model=power_model)
+    # --------------------------------------------------------
+    # Snapshot the impact estimate at decision time.
+    # --------------------------------------------------------
+
+    impact = calculate_what_if(
+        db,
+        recommendation,
+        power_model=power_model,
+    )
 
     operator_action = models.OperatorAction(
         recommendation_id=recommendation.id,
         server_id=recommendation.server_id,
         action=action,
         notes=notes,
-        estimated_energy_saving_kwh=impact.get("estimated_energy_saving_kwh"),
-        estimated_carbon_reduction_kg=impact.get("estimated_carbon_reduction_kg"),
-        estimated_cost_saving=impact.get("estimated_cost_saving"),
-        estimated_storage_reclaimed_gb=impact.get("estimated_storage_reclaimed_gb"),
-        target_server_id=impact.get("target_server_id"),
+
+        estimated_energy_saving_kwh=impact.get(
+            "estimated_energy_saving_kwh"
+        ),
+
+        estimated_carbon_reduction_kg=impact.get(
+            "estimated_carbon_reduction_kg"
+        ),
+
+        estimated_cost_saving=impact.get(
+            "estimated_cost_saving"
+        ),
+
+        estimated_storage_reclaimed_gb=impact.get(
+            "estimated_storage_reclaimed_gb"
+        ),
+
+        target_server_id=impact.get(
+            "target_server_id"
+        ),
     )
 
     db.add(operator_action)
 
     db.commit()
+
     db.refresh(operator_action)
 
     return operator_action

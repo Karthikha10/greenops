@@ -1049,14 +1049,208 @@ def get_thresholds():
 
 
 # ---------------------------------------------------------------------------
-# ESG report -- aggregated decision log, a different artifact from the live
-# operational dashboard, meant for compliance/disclosure-style review
+# ESG report
 # ---------------------------------------------------------------------------
 
 def _esg_report_data(days: int, db: Session) -> dict:
-    days = max(1, min(days, 365))
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    """Build the ESG report from telemetry plus the operator decision audit trail.
 
+    Important: ESG baseline metrics are calculated from telemetry whether or not
+    an operator has accepted any recommendation. Accepted actions are reported
+    separately as estimated optimization impact.
+    """
+    days = max(1, min(days, 365))
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=days)
+
+    server_rows = (
+        db.query(models.ServerTelemetry)
+        .filter(models.ServerTelemetry.timestamp >= cutoff)
+        .order_by(models.ServerTelemetry.timestamp.asc())
+        .all()
+    )
+    power_rows = (
+        db.query(models.PowerTelemetry)
+        .filter(models.PowerTelemetry.timestamp >= cutoff)
+        .order_by(models.PowerTelemetry.timestamp.asc())
+        .all()
+    )
+    cooling_rows = (
+        db.query(models.CoolingTelemetry)
+        .filter(models.CoolingTelemetry.timestamp >= cutoff)
+        .order_by(models.CoolingTelemetry.timestamp.asc())
+        .all()
+    )
+
+    # ------------------------------------------------------------------
+    # Environmental baseline
+    # ------------------------------------------------------------------
+    energy_by_server = defaultdict(float)
+    for server_id in {row.server_id for row in power_rows}:
+        rows = [row for row in power_rows if row.server_id == server_id]
+        rows.sort(key=lambda row: row.timestamp)
+        for previous, current in zip(rows, rows[1:]):
+            hours = (current.timestamp - previous.timestamp).total_seconds() / 3600.0
+            if 0 < hours <= rules_engine.MAX_INTERVAL_HOURS:
+                energy_by_server[server_id] += previous.facility_power_kw * hours
+
+    energy_kwh = round(sum(energy_by_server.values()), 2)
+    cost = round(energy_kwh * TARIFF_PER_KWH, 2)
+    carbon_kg = round(energy_kwh * CARBON_INTENSITY_KG_PER_KWH, 2)
+
+    cooling_type_by_server = dict(
+        db.query(models.Server.server_id, models.Server.cooling_type).all()
+    )
+    water_l = rules_engine.compute_wue_liters_weighted(
+        energy_by_server,
+        cooling_type_by_server,
+    )
+    water_l = round(float(water_l or 0), 2)
+
+    try:
+        wue_result = rules_engine.compute_wue_rate(
+            db,
+            window_hours=WUE_WINDOW_HOURS,
+        )
+        wue = wue_result.get("rate_l_per_kwh")
+        wue_window = wue_result.get("window_hours", WUE_WINDOW_HOURS)
+    except Exception:
+        wue = None
+        wue_window = WUE_WINDOW_HOURS
+
+    # ------------------------------------------------------------------
+    # Operational baseline
+    # ------------------------------------------------------------------
+    cpu_values = [r.cpu_utilization for r in server_rows if r.cpu_utilization is not None]
+    memory_values = [r.memory_utilization for r in server_rows if r.memory_utilization is not None]
+    cooling_efficiency_values = [
+        r.cooling_efficiency for r in cooling_rows
+        if r.cooling_efficiency is not None
+    ]
+    it_power_values = [r.it_power_kw for r in power_rows if r.it_power_kw is not None]
+    facility_power_values = [
+        r.facility_power_kw for r in power_rows
+        if r.facility_power_kw is not None
+    ]
+
+    avg_cpu = _safe_average(cpu_values)
+    avg_memory = _safe_average(memory_values)
+    avg_cooling_efficiency = _safe_average(cooling_efficiency_values)
+    avg_it_power = _safe_average(it_power_values)
+    avg_facility_power = _safe_average(facility_power_values)
+
+    # PUE = Total Facility Power / IT Equipment Power.
+    # Calculate it directly here so the KPI, CSV and PDF all use the same value.
+    avg_pue = None
+    if (
+        avg_it_power is not None
+        and avg_it_power > 0
+        and avg_facility_power is not None
+        and avg_facility_power > 0
+    ):
+        avg_pue = round(avg_facility_power / avg_it_power, 3)
+
+    server_meta = {
+        row.server_id: row
+        for row in db.query(models.Server).all()
+    }
+
+    per_server_cpu = defaultdict(list)
+    for row in server_rows:
+        if row.cpu_utilization is not None:
+            per_server_cpu[row.server_id].append(row.cpu_utilization)
+
+    underutilized_servers = 0
+    server_utilization = []
+    for server_id, values in per_server_cpu.items():
+        server = server_meta.get(server_id)
+        average = _safe_average(values)
+        threshold = (
+            rules_engine.get_idle_threshold(server.server_type)
+            if server else None
+        )
+        is_underutilized = (
+            average is not None
+            and threshold is not None
+            and average < threshold
+        )
+        if is_underutilized:
+            underutilized_servers += 1
+
+        server_utilization.append({
+            "server_id": server_id,
+            "server_type": server.server_type if server else "Unknown",
+            "avg_cpu": average,
+            "idle_threshold": threshold,
+            "underutilized": is_underutilized,
+        })
+
+    # ------------------------------------------------------------------
+    # Daily environmental / operational trend
+    # ------------------------------------------------------------------
+    start_date = cutoff.date()
+    end_date = now.date()
+
+    daily = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_string = current_date.isoformat()
+        day_server = [r for r in server_rows if r.timestamp.date() == current_date]
+        day_power = [r for r in power_rows if r.timestamp.date() == current_date]
+        day_cooling = [r for r in cooling_rows if r.timestamp.date() == current_date]
+
+        day_cpu = [r.cpu_utilization for r in day_server if r.cpu_utilization is not None]
+        day_memory = [r.memory_utilization for r in day_server if r.memory_utilization is not None]
+        day_it = [r.it_power_kw for r in day_power if r.it_power_kw is not None]
+        day_facility = [r.facility_power_kw for r in day_power if r.facility_power_kw is not None]
+        day_cooling_eff = [
+            r.cooling_efficiency for r in day_cooling
+            if r.cooling_efficiency is not None
+        ]
+
+        # Integrate only intervals fully contained within the calendar day.
+        day_energy = 0.0
+        by_server = defaultdict(list)
+        for row in day_power:
+            by_server[row.server_id].append(row)
+        for rows in by_server.values():
+            rows.sort(key=lambda row: row.timestamp)
+            for previous, current in zip(rows, rows[1:]):
+                hours = (current.timestamp - previous.timestamp).total_seconds() / 3600.0
+                if 0 < hours <= rules_engine.MAX_INTERVAL_HOURS:
+                    day_energy += previous.facility_power_kw * hours
+
+        # Daily PUE = average facility power / average IT power.
+        day_pue = None
+        day_avg_it = _safe_average(day_it)
+        day_avg_facility = _safe_average(day_facility)
+        if (
+            day_avg_it is not None
+            and day_avg_it > 0
+            and day_avg_facility is not None
+            and day_avg_facility > 0
+        ):
+            day_pue = round(day_avg_facility / day_avg_it, 3)
+
+        has_data = bool(day_server or day_power or day_cooling)
+
+        daily.append({
+            "date": date_string,
+            "energy_kwh": round(day_energy, 4),
+            "carbon_kg": round(day_energy * CARBON_INTENSITY_KG_PER_KWH, 4),
+            "cost": round(day_energy * TARIFF_PER_KWH, 2),
+            "water_liters": None,
+            "avg_cpu": _safe_average(day_cpu),
+            "avg_memory": _safe_average(day_memory),
+            "avg_pue": day_pue,
+            "avg_cooling_efficiency": _safe_average(day_cooling_eff),
+            "has_data": has_data,
+        })
+        current_date += timedelta(days=1)
+
+    # ------------------------------------------------------------------
+    # Operator decision audit trail
+    # ------------------------------------------------------------------
     actions = (
         db.query(models.OperatorAction)
         .filter(models.OperatorAction.created_at >= cutoff)
@@ -1068,24 +1262,60 @@ def _esg_report_data(days: int, db: Session) -> dict:
     snoozed = [a for a in actions if a.action == "snooze"]
     rejected = [a for a in actions if a.action == "do_nothing"]
 
+    optimization_impact = {
+        "accepted_actions": len(accepted),
+        "energy_saved_kwh": round(
+            sum(a.estimated_energy_saving_kwh or 0 for a in accepted), 2
+        ),
+        "carbon_reduced_kg": round(
+            sum(a.estimated_carbon_reduction_kg or 0 for a in accepted), 2
+        ),
+        "cost_saved": round(
+            sum(a.estimated_cost_saving or 0 for a in accepted), 2
+        ),
+        "storage_reclaimed_gb": round(
+            sum(a.estimated_storage_reclaimed_gb or 0 for a in accepted), 2
+        ),
+    }
+
     return {
-        "range": {"days": days, "from": cutoff.isoformat(), "to": datetime.utcnow().isoformat()},
+        "range": {
+            "days": days,
+            "from": cutoff.isoformat(),
+            "to": now.isoformat(),
+        },
+        "environmental": {
+            "energy_kwh": energy_kwh,
+            "carbon_kg": carbon_kg,
+            "cost": cost,
+            "water_liters": water_l,
+            "wue": wue,
+            "wue_window_hours": wue_window,
+        },
+        "operational_efficiency": {
+            "avg_cpu": avg_cpu,
+            "avg_memory": avg_memory,
+            "avg_pue": avg_pue,
+            "avg_cooling_efficiency": avg_cooling_efficiency,
+            "underutilized_servers": underutilized_servers,
+            "servers_observed": len(per_server_cpu),
+        },
+        # Top-level alias kept for KPI components that read report.avg_pue directly.
+        "avg_pue": avg_pue,
+        "optimization_impact": optimization_impact,
         "decision_counts": {
             "accepted": len(accepted),
             "snoozed": len(snoozed),
             "rejected": len(rejected),
             "total": len(actions),
         },
-        "estimated_impact_of_accepted_decisions": {
-            "energy_kwh": round(sum(a.estimated_energy_saving_kwh or 0 for a in accepted), 2),
-            "carbon_kg": round(sum(a.estimated_carbon_reduction_kg or 0 for a in accepted), 2),
-            "cost": round(sum(a.estimated_cost_saving or 0 for a in accepted), 2),
-            "storage_reclaimed_gb": round(sum(a.estimated_storage_reclaimed_gb or 0 for a in accepted), 2),
-        },
+        "daily": daily,
+        "server_utilization": server_utilization,
         "note": (
-            "These are estimates captured at the moment each decision was made -- GreenOps has no "
-            "mechanism to confirm a consolidation or storage change was actually carried out, or to "
-            "re-measure its real effect afterward. Treat this as a decision log, not a verified savings report."
+            "Environmental and operational metrics are calculated from telemetry. "
+            "Optimization impact contains estimates captured when accepted operator "
+            "decisions were recorded. GreenOps does not directly modify infrastructure "
+            "or verify realized savings after an action."
         ),
         "decisions": [
             {
@@ -1112,32 +1342,73 @@ def esg_report(days: int = 30, db: Session = Depends(get_db)):
 
 @app.get("/reports/esg/export")
 def esg_report_export(days: int = 30, db: Session = Depends(get_db)):
-    """Same data as /reports/esg, as a downloadable CSV of the decision log."""
+    """Download the ESG report as CSV."""
     import csv
     import io
     from fastapi.responses import Response
 
     data = _esg_report_data(days, db)
-
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow([f"GreenOps ESG decision log -- last {data['range']['days']} days"])
-    writer.writerow([f"Generated {data['range']['to']}"])
+
+    writer.writerow([f"GreenOps ESG Report -- last {data['range']['days']} days"])
+    writer.writerow([f"Reporting period: {data['range']['from']} to {data['range']['to']}"])
     writer.writerow([])
-    writer.writerow(["accepted", "snoozed", "rejected", "total"])
+
+    env = data["environmental"]
+    eff = data["operational_efficiency"]
+    impact = data["optimization_impact"]
+    counts = data["decision_counts"]
+
+    writer.writerow(["ENVIRONMENTAL PERFORMANCE"])
+    writer.writerow(["Metric", "Value"])
+    writer.writerow(["Energy (kWh)", env["energy_kwh"]])
+    writer.writerow(["Carbon (kg)", env["carbon_kg"]])
+    writer.writerow(["Estimated cost", env["cost"]])
+    writer.writerow(["Estimated water (L)", env["water_liters"]])
+    writer.writerow(["WUE (L/kWh)", env["wue"]])
+    writer.writerow([])
+
+    writer.writerow(["OPERATIONAL EFFICIENCY"])
+    writer.writerow(["Metric", "Value"])
+    writer.writerow(["Average CPU (%)", eff["avg_cpu"]])
+    writer.writerow(["Average Memory (%)", eff["avg_memory"]])
+    writer.writerow(["Average PUE", eff["avg_pue"]])
+    writer.writerow(["Cooling Efficiency", eff["avg_cooling_efficiency"]])
+    writer.writerow(["Underutilized Servers", eff["underutilized_servers"]])
+    writer.writerow(["Servers Observed", eff["servers_observed"]])
+    writer.writerow([])
+
+    writer.writerow(["OPTIMIZATION IMPACT"])
+    writer.writerow(["Metric", "Value"])
+    writer.writerow(["Accepted Actions", impact["accepted_actions"]])
+    writer.writerow(["Energy Saved (kWh)", impact["energy_saved_kwh"]])
+    writer.writerow(["Carbon Reduced (kg)", impact["carbon_reduced_kg"]])
+    writer.writerow(["Cost Saved", impact["cost_saved"]])
+    writer.writerow(["Storage Reclaimed (GB)", impact["storage_reclaimed_gb"]])
+    writer.writerow([])
+
+    writer.writerow(["DECISION SUMMARY"])
+    writer.writerow(["Accepted", counts["accepted"]])
+    writer.writerow(["Snoozed", counts["snoozed"]])
+    writer.writerow(["Rejected", counts["rejected"]])
+    writer.writerow(["Total", counts["total"]])
+    writer.writerow([])
+
+    writer.writerow(["DAILY TREND"])
     writer.writerow([
-        data["decision_counts"]["accepted"],
-        data["decision_counts"]["snoozed"],
-        data["decision_counts"]["rejected"],
-        data["decision_counts"]["total"],
+        "date", "energy_kwh", "carbon_kg", "cost", "avg_cpu",
+        "avg_memory", "avg_pue", "avg_cooling_efficiency", "has_data"
     ])
+    for row in data["daily"]:
+        writer.writerow([
+            row["date"], row["energy_kwh"], row["carbon_kg"], row["cost"],
+            row["avg_cpu"], row["avg_memory"], row["avg_pue"],
+            row["avg_cooling_efficiency"], row["has_data"],
+        ])
     writer.writerow([])
-    writer.writerow(["estimated energy (kWh)", "estimated carbon (kg)", "estimated cost", "storage reclaimed (GB)"])
-    impact = data["estimated_impact_of_accepted_decisions"]
-    writer.writerow([impact["energy_kwh"], impact["carbon_kg"], impact["cost"], impact["storage_reclaimed_gb"]])
-    writer.writerow([])
-    writer.writerow([data["note"]])
-    writer.writerow([])
+
+    writer.writerow(["DECISION AUDIT TRAIL"])
     writer.writerow([
         "id", "server_id", "target_server_id", "action", "notes",
         "estimated_energy_saving_kwh", "estimated_carbon_reduction_kg",
@@ -1145,15 +1416,296 @@ def esg_report_export(days: int = 30, db: Session = Depends(get_db)):
     ])
     for row in data["decisions"]:
         writer.writerow([
-            row["id"], row["server_id"], row["target_server_id"] or "", row["action"], row["notes"] or "",
-            row["estimated_energy_saving_kwh"], row["estimated_carbon_reduction_kg"],
-            row["estimated_cost_saving"], row["estimated_storage_reclaimed_gb"], row["created_at"],
+            row["id"], row["server_id"], row["target_server_id"] or "",
+            row["action"], row["notes"] or "",
+            row["estimated_energy_saving_kwh"],
+            row["estimated_carbon_reduction_kg"],
+            row["estimated_cost_saving"],
+            row["estimated_storage_reclaimed_gb"],
+            row["created_at"],
         ])
+
+    writer.writerow([])
+    writer.writerow([data["note"]])
 
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=greenops_esg_report_{days}d.csv"},
+        headers={
+            "Content-Disposition":
+            f"attachment; filename=greenops_esg_report_{days}d.csv"
+        },
+    )
+
+
+@app.get("/reports/esg/export/pdf")
+def esg_report_export_pdf(days: int = 30, db: Session = Depends(get_db)):
+    """Generate a human-readable ESG PDF with summary metrics and trend charts."""
+    import io
+
+    from fastapi.responses import Response
+
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+            Image,
+            PageBreak,
+        )
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PDF export requires reportlab and matplotlib. "
+                "Install them with: pip install reportlab matplotlib"
+            ),
+        ) from exc
+
+    data = _esg_report_data(days, db)
+    env = data["environmental"]
+    eff = data["operational_efficiency"]
+    impact = data["optimization_impact"]
+    counts = data["decision_counts"]
+
+    pdf_buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title="GreenOps ESG & Sustainability Report",
+        author="GreenOps",
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "GreenOpsTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=20,
+        leading=24,
+        spaceAfter=8,
+    )
+    section_style = ParagraphStyle(
+        "GreenOpsSection",
+        parent=styles["Heading2"],
+        fontSize=13,
+        leading=16,
+        spaceBefore=8,
+        spaceAfter=6,
+    )
+    small_style = ParagraphStyle(
+        "GreenOpsSmall",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+    )
+
+    story = []
+    story.append(Paragraph("GreenOps ESG & Sustainability Report", title_style))
+    story.append(Paragraph(
+        f"Reporting period: {data['range']['from']} to {data['range']['to']}",
+        styles["BodyText"],
+    ))
+    story.append(Spacer(1, 8))
+
+    # Executive summary
+    story.append(Paragraph("1. Executive Summary", section_style))
+    summary_data = [
+        ["Energy", f"{env['energy_kwh']:.2f} kWh"],
+        ["Carbon", f"{env['carbon_kg']:.2f} kg CO2e"],
+        ["Estimated Cost", f"{env['cost']:.2f}"],
+        ["Estimated Water", f"{env['water_liters']:.2f} L"],
+        ["Average PUE", "—" if eff["avg_pue"] is None else f"{eff['avg_pue']:.3f}"],
+        ["Average CPU", "—" if eff["avg_cpu"] is None else f"{eff['avg_cpu']:.2f}%"],
+        ["Underutilized Servers", str(eff["underutilized_servers"])],
+        ["Accepted Recommendations", str(impact["accepted_actions"])],
+    ]
+    table = Table(summary_data, colWidths=[65 * mm, 65 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF2F8")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 10))
+
+    # Environmental performance
+    story.append(Paragraph("2. Environmental Performance", section_style))
+    environmental_table = Table([
+        ["Metric", "Value"],
+        ["Energy Consumption", f"{env['energy_kwh']:.2f} kWh"],
+        ["Estimated Carbon", f"{env['carbon_kg']:.2f} kg"],
+        ["Estimated Cost", f"{env['cost']:.2f}"],
+        ["Estimated Water", f"{env['water_liters']:.2f} L"],
+        ["WUE", "—" if env["wue"] is None else f"{env['wue']:.3f} L/kWh"],
+    ], colWidths=[70 * mm, 60 * mm])
+    environmental_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D5F5E3")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(environmental_table)
+
+    # Operational efficiency
+    story.append(Paragraph("3. Operational Efficiency", section_style))
+    operational_table = Table([
+        ["Metric", "Value"],
+        ["Average CPU", "—" if eff["avg_cpu"] is None else f"{eff['avg_cpu']:.2f}%"],
+        ["Average Memory", "—" if eff["avg_memory"] is None else f"{eff['avg_memory']:.2f}%"],
+        ["Average PUE", "—" if eff["avg_pue"] is None else f"{eff['avg_pue']:.3f}"],
+        ["Cooling Efficiency", "—" if eff["avg_cooling_efficiency"] is None else f"{eff['avg_cooling_efficiency']:.3f}"],
+        ["Underutilized Servers", str(eff["underutilized_servers"])],
+        ["Servers Observed", str(eff["servers_observed"])],
+    ], colWidths=[70 * mm, 60 * mm])
+    operational_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FCF3CF")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(operational_table)
+
+    # Trend charts
+    chart_rows = [row for row in data["daily"] if row["has_data"]]
+    if chart_rows:
+        dates = [row["date"] for row in chart_rows]
+
+        energy_values = [row["energy_kwh"] for row in chart_rows]
+        fig1, ax1 = plt.subplots(figsize=(7.0, 3.0))
+        ax1.plot(dates, energy_values, marker="o")
+        ax1.set_title("Daily Energy Consumption")
+        ax1.set_ylabel("Energy (kWh)")
+        ax1.grid(True, alpha=0.3)
+        fig1.autofmt_xdate(rotation=45)
+        fig1.tight_layout()
+        energy_buffer = io.BytesIO()
+        fig1.savefig(energy_buffer, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig1)
+        energy_buffer.seek(0)
+
+        carbon_values = [row["carbon_kg"] for row in chart_rows]
+        fig2, ax2 = plt.subplots(figsize=(7.0, 3.0))
+        ax2.plot(dates, carbon_values, marker="o")
+        ax2.set_title("Daily Estimated Carbon")
+        ax2.set_ylabel("Carbon (kg)")
+        ax2.grid(True, alpha=0.3)
+        fig2.autofmt_xdate(rotation=45)
+        fig2.tight_layout()
+        carbon_buffer = io.BytesIO()
+        fig2.savefig(carbon_buffer, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig2)
+        carbon_buffer.seek(0)
+
+        story.append(PageBreak())
+        story.append(Paragraph("4. Energy & Carbon Trends", section_style))
+        story.append(Image(energy_buffer, width=170 * mm, height=72 * mm))
+        story.append(Spacer(1, 8))
+        story.append(Image(carbon_buffer, width=170 * mm, height=72 * mm))
+
+    # Optimization impact
+    story.append(PageBreak())
+    story.append(Paragraph("5. Optimization Impact", section_style))
+    impact_table = Table([
+        ["Metric", "Value"],
+        ["Accepted Actions", str(impact["accepted_actions"])],
+        ["Estimated Energy Saved", f"{impact['energy_saved_kwh']:.2f} kWh"],
+        ["Estimated Carbon Reduced", f"{impact['carbon_reduced_kg']:.2f} kg"],
+        ["Estimated Cost Saved", f"{impact['cost_saved']:.2f}"],
+        ["Storage Reclaimed", f"{impact['storage_reclaimed_gb']:.2f} GB"],
+    ], colWidths=[75 * mm, 55 * mm])
+    impact_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D6EAF8")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(impact_table)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        "Optimization figures are estimates captured when an operator accepted a recommendation. "
+        "They are not verified post-action savings.",
+        small_style,
+    ))
+
+    # Decision audit trail
+    story.append(Paragraph("6. Decision Audit Trail", section_style))
+    audit_data = [[
+        "ID", "Server", "Target", "Action", "Energy kWh", "Carbon kg", "Created"
+    ]]
+    for row in data["decisions"]:
+        created = row["created_at"][:19].replace("T", " ")
+        audit_data.append([
+            str(row["id"]),
+            str(row["server_id"]),
+            str(row["target_server_id"] or "—"),
+            str(row["action"]),
+            f"{row['estimated_energy_saving_kwh'] or 0:.2f}",
+            f"{row['estimated_carbon_reduction_kg'] or 0:.2f}",
+            created,
+        ])
+
+    if len(audit_data) == 1:
+        audit_data.append(["—", "—", "—", "No actions", "0.00", "0.00", "—"])
+
+    audit_table = Table(
+        audit_data,
+        repeatRows=1,
+        colWidths=[12 * mm, 25 * mm, 25 * mm, 25 * mm, 22 * mm, 22 * mm, 35 * mm],
+    )
+    audit_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAECEE")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("PADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(audit_table)
+
+    # Methodology
+    story.append(Paragraph("7. Methodology & Assumptions", section_style))
+    methodology = [
+        f"Energy is estimated by integrating facility power across adjacent telemetry readings within the configured interval guard ({rules_engine.MAX_INTERVAL_HOURS} hours).",
+        f"Estimated cost uses a configured tariff of {TARIFF_PER_KWH:.2f} per kWh.",
+        f"Estimated carbon uses a configured carbon intensity of {CARBON_INTENSITY_KG_PER_KWH:.2f} kg CO2e per kWh.",
+        "Water usage is an estimate weighted by the cooling type associated with each server.",
+        "PUE is facility power divided by IT power over the same observed window.",
+        "Operator decisions are recommendations recorded for human review; GreenOps does not directly control physical infrastructure.",
+    ]
+    for item in methodology:
+        story.append(Paragraph("• " + item, small_style))
+        story.append(Spacer(1, 2))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(data["note"], small_style))
+
+    doc.build(story)
+    pdf_buffer.seek(0)
+
+    return Response(
+        content=pdf_buffer.getvalue(),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition":
+            f"attachment; filename=greenops_esg_report_{days}d.pdf"
+        },
     )
 
 

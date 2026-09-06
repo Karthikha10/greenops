@@ -1,3 +1,4 @@
+
 """
 Computes per-server-type idle CPU thresholds and severity weights from the
 real historical dataset, replacing the old flat 20%-for-everyone threshold.

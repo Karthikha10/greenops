@@ -158,6 +158,9 @@ export const api = {
   esgReportExportUrl: (days = 30) =>
     `${API_BASE}/reports/esg/export?days=${days}`,
 
+  esgReportPdfUrl: (days = 30) =>
+  `${API_BASE}/reports/esg/export/pdf?days=${days}`,
+
   // ----------------------------------------------------------
   // OPERATOR ACTIONS
   // ----------------------------------------------------------
