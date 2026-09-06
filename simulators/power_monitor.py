@@ -28,8 +28,8 @@ import requests
 
 API_BASE = "http://localhost:8000"
 
-# S6 added
-SERVER_IDS = ["S1", "S2", "S3", "S4", "S5", "S6"]
+# S6 added; S7-S13 added for a richer same-type candidate pool
+SERVER_IDS = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13"]
 
 INTERVAL_SECONDS = 15
 

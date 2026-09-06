@@ -44,6 +44,17 @@ SERVERS = {
     "S4": {"bias": 0.15},   # deliberately idle
     "S5": {"bias": 0.12},   # deliberately idle
     "S6": {"bias": 0.05},   # deliberately very idle
+
+    # Added for a richer same-type candidate pool -- GPU, Storage and Edge
+    # previously had only one peer each (or none), so consolidation ranking
+    # never had more than a single candidate to actually rank.
+    "S7": {"bias": 0.55},   # GPU, healthy
+    "S8": {"bias": 0.10},   # GPU, deliberately idle
+    "S9": {"bias": 0.45},   # Storage, healthy
+    "S10": {"bias": 0.14},  # Storage, deliberately idle
+    "S11": {"bias": 0.50},  # Edge, healthy
+    "S12": {"bias": 0.16},  # Edge, deliberately idle
+    "S13": {"bias": 0.70},  # Compute, healthy
 }
 
 
@@ -148,6 +159,51 @@ def register_servers():
             "server_type": "Compute",
             "cooling_type": "Air",
             "datacenter_region": "APAC",
+        },
+
+        # -------------------------------------------------------
+        # ADDITIONAL SERVERS -- richer same-type candidate pools
+        # -------------------------------------------------------
+        "S7": {
+            "server_type": "GPU",
+            "cooling_type": "Evaporative",
+            "datacenter_region": "EMEA",
+        },
+
+        "S8": {
+            "server_type": "GPU",
+            "cooling_type": "Evaporative",
+            "datacenter_region": "NA",
+        },
+
+        "S9": {
+            "server_type": "Storage",
+            "cooling_type": "Liquid",
+            "datacenter_region": "NA",
+        },
+
+        "S10": {
+            "server_type": "Storage",
+            "cooling_type": "Liquid",
+            "datacenter_region": "APAC",
+        },
+
+        "S11": {
+            "server_type": "Edge",
+            "cooling_type": "Air",
+            "datacenter_region": "APAC",
+        },
+
+        "S12": {
+            "server_type": "Edge",
+            "cooling_type": "Air",
+            "datacenter_region": "EMEA",
+        },
+
+        "S13": {
+            "server_type": "Compute",
+            "cooling_type": "Air",
+            "datacenter_region": "NA",
         },
     }
 

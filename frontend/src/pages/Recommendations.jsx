@@ -24,6 +24,23 @@ function safetyBadge(rec) {
   return null;
 }
 
+// The target candidate's own near-term CPU forecast (independent of the
+// workload being moved onto it) -- pulled from the same `candidates` array
+// the detail page renders as a table, matched by target_server_id so this
+// list stays in sync with whichever candidate actually won.
+function targetForecast(rec) {
+  if (rec.recommendation_type !== "consolidate" || !rec.impact?.target_server_id) {
+    return null;
+  }
+  const target = rec.impact.candidates?.find(
+    (c) => c.server_id === rec.impact.target_server_id
+  );
+  if (!target || target.forecast_predicted_cpu === null || target.forecast_predicted_cpu === undefined) {
+    return null;
+  }
+  return target;
+}
+
 export default function Recommendations() {
   const navigate = useNavigate();
   const [recommendations, setRecommendations] = useState([]);
@@ -111,6 +128,7 @@ export default function Recommendations() {
                 <th>Action</th>
                 <th>Priority</th>
                 <th>Target / status</th>
+                <th>Target forecast (CPU)</th>
                 <th style={{ textAlign: "right" }}>Score</th>
                 <th></th>
               </tr>
@@ -132,6 +150,23 @@ export default function Recommendations() {
                     <span className={`badge ${rec.priority}`}>{rec.priority}</span>
                   </td>
                   <td>{safetyBadge(rec) || <span className="row-meaning">—</span>}</td>
+                  <td>
+                    {(() => {
+                      const target = targetForecast(rec);
+                      if (!target) return <span className="row-meaning">—</span>;
+                      const rising = target.forecast_predicted_cpu > target.current_cpu + 0.5;
+                      const falling = target.forecast_predicted_cpu < target.current_cpu - 0.5;
+                      return (
+                        <span title={`${rec.impact.target_server_id}'s own forecast, independent of this move`}>
+                          {target.current_cpu.toFixed(1)}%{" "}
+                          <span style={{ color: "var(--text-muted)" }}>→</span>{" "}
+                          {target.forecast_predicted_cpu.toFixed(1)}%
+                          {rising && <span style={{ color: "var(--danger-text)" }}> ↑</span>}
+                          {falling && <span style={{ color: "var(--accent-dark)" }}> ↓</span>}
+                        </span>
+                      );
+                    })()}
+                  </td>
                   <td style={{ textAlign: "right", fontWeight: 600 }}>
                     {typeof rec.score === "number" ? rec.score.toFixed(2) : "—"}
                   </td>

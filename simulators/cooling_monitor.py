@@ -29,6 +29,19 @@ SERVER_COOLING = {
 
     # S6 added
     "S6": "Air",
+
+    # S7-S13 added -- must match server_monitor.py's register_servers()
+    # cooling_type per server_id exactly, since that's what gets stored on
+    # the Server record and used for WUE lookups; this dict only affects
+    # the per-reading CoolingTelemetry.cooling_type field shown on Server
+    # Detail, which should agree with it.
+    "S7": "Evaporative",
+    "S8": "Evaporative",
+    "S9": "Liquid",
+    "S10": "Liquid",
+    "S11": "Air",
+    "S12": "Air",
+    "S13": "Air",
 }
 
 
