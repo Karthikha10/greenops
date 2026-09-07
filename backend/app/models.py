@@ -133,7 +133,10 @@ class OperatorAction(Base):
     Stores the operator's decision on a recommendation, plus a snapshot of
     the estimated impact at the moment the decision was made. The snapshot
     is what was ESTIMATED then, not a verified after-the-fact measurement --
-    GreenOps has no mechanism to confirm a consolidation actually happened.
+    GreenOps still has no AUTOMATIC way to confirm a consolidation actually
+    happened. executed_at/execution_note (below) let an operator manually
+    confirm it did, once they've actually done it -- a human attestation,
+    not a verification.
     """
     __tablename__ = "operator_actions"
 
@@ -161,6 +164,12 @@ class OperatorAction(Base):
     estimated_storage_reclaimed_gb = Column(Float, nullable=True)
     target_server_id = Column(String, nullable=True)
     # The candidate server selected for a consolidate action, if any.
+
+    # Set when the operator confirms the action has actually been carried
+    # out. NULL means approved but not yet executed. GreenOps cannot verify
+    # this automatically -- it relies entirely on the operator marking it.
+    executed_at = Column(DateTime, nullable=True)
+    execution_note = Column(String, nullable=True)
 
     created_at = Column(
         DateTime,

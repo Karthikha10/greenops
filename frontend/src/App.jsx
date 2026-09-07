@@ -10,6 +10,7 @@ import Analytics from "./pages/Analytics";
 import ModelEval from "./pages/ModelEval";
 import Recommendations from "./pages/Recommendations";
 import RecommendationDetail from "./pages/RecommendationDetail";
+import ApprovedActions from "./pages/ApprovedActions";
 import Preferences from "./pages/Preferences";
 import Reports from "./pages/Reports";
 
@@ -39,6 +40,9 @@ export default function App() {
           {/* Recommendations */}
           <Route path="recommendations" element={<Recommendations />} />
           <Route path="recommendations/:id" element={<RecommendationDetail />} />
+
+          {/* Approved actions */}
+          <Route path="approved-actions" element={<ApprovedActions />} />
 
           {/* Preferences */}
           <Route path="preferences" element={<Preferences />} />

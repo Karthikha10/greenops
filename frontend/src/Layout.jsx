@@ -69,6 +69,11 @@ const links = [
     icon: "✓",
   },
   {
+    to: "/approved-actions",
+    label: "Approved actions",
+    icon: "◉",
+  },
+  {
     to: "/reports",
     label: "ESG report",
     icon: "▦",

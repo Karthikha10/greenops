@@ -678,9 +678,44 @@ def operator_actions(
             "estimated_cost_saving": row.estimated_cost_saving,
             "estimated_storage_reclaimed_gb": row.estimated_storage_reclaimed_gb,
             "created_at": row.created_at.isoformat(),
+            "executed_at": row.executed_at.isoformat() if row.executed_at else None,
+            "execution_note": row.execution_note,
         }
         for row in rows
     ]
+
+
+@app.patch("/operator-actions/{action_id}")
+def update_operator_action(
+    action_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    Mark an approved operator action as executed (or clear execution).
+
+    Accepts JSON body: { "executed": true/false, "execution_note": "..." }
+
+    This is the only mutation allowed on an existing OperatorAction. It
+    records that the operator has manually confirmed the action was
+    carried out -- GreenOps cannot verify this automatically.
+    """
+    row = db.query(models.OperatorAction).filter(models.OperatorAction.id == action_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Operator action not found.")
+
+    if "executed" in payload:
+        row.executed_at = datetime.utcnow() if payload["executed"] else None
+
+    if "execution_note" in payload:
+        row.execution_note = payload.get("execution_note") or None
+
+    db.commit()
+    return {
+        "id": row.id,
+        "executed_at": row.executed_at.isoformat() if row.executed_at else None,
+        "execution_note": row.execution_note,
+    }
 
 
 @app.get("/flags")

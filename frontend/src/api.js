@@ -171,6 +171,9 @@ export const api = {
     client.get("/operator-actions", {
       params: { limit },
     }),
+
+  operatorActionUpdate: (id, payload) =>
+    client.patch(`/operator-actions/${id}`, payload),
 };
 
 export default api;

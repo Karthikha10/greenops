@@ -96,6 +96,7 @@ frontend/                  # React + Vite + react-router-dom + recharts
       Storage.jsx      Analytics.jsx     ModelEval.jsx
       Recommendations.jsx           # LIST view -- compact table, click a row to go to detail
       RecommendationDetail.jsx        # DETAIL view -- full explanation, ranked candidates, what-if impact, decision buttons
+      ApprovedActions.jsx               # Approved decisions -- manually mark executed/note, /approved-actions
       Preferences.jsx                   # Ranking weight sliders
       Reports.jsx                         # ESG decision-log report + CSV export
 frontend-static-legacy/     # old single-file HTML dashboard, superseded, reference only
@@ -536,6 +537,24 @@ anywhere in this system to confirm a consolidation was actually carried out
 or to re-measure its real effect afterward. Don't let UI copy imply
 otherwise.
 
+**Approved Actions page** (`frontend/src/pages/ApprovedActions.jsx`,
+`/approved-actions`) — the one narrow exception to that "no mechanism"
+statement, and it's honest about being narrow: `OperatorAction` gained two
+columns, `executed_at` and `execution_note`, settable only via
+`PATCH /operator-actions/{action_id}` (body: `{"executed": true/false,
+"execution_note": "..."}`). This is **manual attestation, not automatic
+verification** — GreenOps still has no way to confirm a consolidation
+actually happened; it only lets an operator say "I did this" and optionally
+leave a note, after the fact. The page lists every `consolidate`/
+`rightsize`/`archive`/`deduplicate` decision (never `snooze`/`do_nothing`,
+those were never "approved" in the first place), with an Awaiting/Executed
+filter and a running total of estimated savings among the ones marked
+executed. There's no delete endpoint — "Remove from log" only hides a row
+client-side, it doesn't touch the database. **Don't read the "Executed"
+count as a verified savings figure** — it's still the same decision-time
+estimate as everywhere else, just for actions someone has since claimed to
+have carried out.
+
 **Duplicate-event ignore** — `_is_duplicate_reading()` in `main.py`: the same
 server posting identical field values again within 2 seconds is treated as a
 retried delivery and silently ignored (`"status": "duplicate_ignored"`), not
@@ -732,6 +751,30 @@ re-verified live:**
     (`Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Select
     ProcessId, CommandLine` in PowerShell shows the full command line per
     PID, not just the process name) before assuming a code bug.
+21. **A third collaborator force-pushed and wiped remote history** — a
+    `git fetch` turned up a forced update to `origin/main`: a single new
+    commit ("recommendation page") by a third person, Kaviya
+    (`11kaviya11@gmail.com`), with **no connection to any prior commit
+    history** — not a merge, not a rebase, a from-scratch push that
+    replaced everything. Confirmed her commit was built on a much older
+    base (`recommendations.py` at 634 lines vs. this session's 1,647;
+    `CLAUDE.md` at 589 lines vs. 700+) — none of this session's work
+    existed in it: no power model fix, no target-candidate forecasting, no
+    13-server setup. Recovered by keeping the local/GitHub-recoverable
+    history as the base (it had the tested work) and manually porting the
+    one thing her commit had that ours didn't: `OperatorAction.executed_at`
+    / `execution_note` + the `PATCH /operator-actions/{id}` endpoint +
+    `ApprovedActions.jsx` (`/approved-actions`) — a real, well-reasoned
+    feature letting an operator manually attest a decision was carried out
+    (see "Phase 2" → "Approved Actions page" above). Required a live
+    Postgres migration (`ALTER TABLE operator_actions ADD COLUMN
+    executed_at TIMESTAMP, ADD COLUMN execution_note VARCHAR`) since
+    `Base.metadata.create_all()` only creates new tables, never adds
+    columns to existing ones. **If `git fetch` ever reports a "forced
+    update" again**, stop and investigate before pulling, merging, or
+    pushing anything — `git merge-base --is-ancestor <your last commit>
+    origin/main` tells you immediately whether your history survived or
+    was replaced.
 
 If something looks numerically "off" again, check for the same class of
 issue: an assumption about cadence/scale that isn't actually enforced
