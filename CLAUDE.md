@@ -314,15 +314,57 @@ CSS classes from `index.css` (`.metric-card`, `.badge`, `.card`,
   add `gridded` everywhere by default; it's a deliberate choice for that one
   table, made after explicit feedback ("clear vertical and horizontal lines
   i want").
-- **Recommendations is list → detail, not everything inline.** `/recommendations`
-  is a compact triage table (Server / Action / Priority / Target-status /
-  Score, no "Why" column — that belongs on the detail page, not the list);
-  clicking a row goes to `/recommendations/:id` (`RecommendationDetail.jsx`),
-  which shows the full explanation, the ranked candidate-targets table, the
-  impact numbers, and the decision buttons. This replaced an earlier
-  version that tried to show everything as expanded inline cards and was
-  reported as "atmost blank and can't comprehend properly" — don't revert
-  to that shape.
+- **Recommendations page history — read this before "fixing" it back to a
+  table.** This page's shape has flipped twice, for different reasons each
+  time, and whoever touches it next should know both:
+  1. Originally a full-card page (explanation, impact, decision buttons, all
+     inline) — reported as "atmost blank and can't comprehend properly."
+  2. Replaced with a compact triage table (Server / Action / Priority /
+     Target-status / Score, no inline decisions) — click a row to go to
+     `/recommendations/:id` for the full explanation and decision buttons.
+     "List is triage, detail is decision" was the rule at this point.
+  3. **Current state**: back to a card-based list (`Recommendations.jsx`,
+     ported from a diverged branch — see "Bugs found and fixed" → git
+     force-push entry), with a plain-language explanation, a mini impact
+     chart, and Accept/Snooze/Dismiss buttons **inline on each card** — a
+     deliberate, explicit reversal of rule #2, chosen with the tradeoff
+     named out loud first. It still links out to `/recommendations/:id`
+     (`RecommendationDetail.jsx`) for the ranked candidate-targets table and
+     full assumptions list, which no card view has ever tried to inline.
+  **If this page gets reported as confusing again, don't reflexively revert
+  to the compact-table shape** — check specifically whether the complaint is
+  about the inline decision buttons (state #1's problem) or something else;
+  the current version already avoids state #1's actual failure mode (dense
+  unreadable cards with no visual hierarchy) by using a real card layout
+  with charts and a sidebar summary, not a wall of expanded text.
+- **`RecommendationDetail.jsx` was swapped the same way, same source branch**
+  — real upgrades: a live CPU-history line chart and a storage-breakdown bar
+  chart (neither existed before), plus a genuinely new capability, letting
+  the operator pick a *different* safe candidate than the top-ranked one and
+  see re-scaled impact estimates (`rescaleImpact()`). Three things were
+  fixed while porting it in, since the source branch predated them:
+  1. Two timestamp bugs — `new Date(r.timestamp)` and
+     `new Date(rec.created_at)` both lacked the `.endsWith("Z") ? ... : ...
+     + "Z"` UTC-parsing fix already applied everywhere else in this project
+     (`ServerDetail.jsx`, `Reports.jsx`). Fixed to match.
+  2. **No forecast awareness at all** — the branch predates target-candidate
+     forecasting entirely (zero references to `forecast`/`safe_now`/
+     `safe_forecast`), and its candidate filter (`allCandidates.filter(c =>
+     c.safe)`) silently hid any candidate that failed either the
+     current-state or the forecast check, indistinguishably. Changed the
+     filter to `c.safe_now !== false` so a forecast-rejected candidate still
+     shows up, and gave `CandidateCard` a real three-way badge (Safe /
+     **Risky soon** / Over limit) plus a small "Own forecast: X% CPU in
+     ~15 min" line, matching the badge semantics already used on the list
+     page. The full assumptions list (which already included the forecast
+     reasoning sentence from the backend) needed no changes — it was already
+     rendering `impact.assumptions` unconditionally.
+  3. **A copy bug independent of the branch swap**: the decision
+     confirmation screen's "this has been saved to the approved actions log
+     ... View approved actions →" note showed unconditionally, even for
+     `snooze`/`do_nothing` — neither of which ever appears on the Approved
+     Actions page (it only lists `consolidate`/`rightsize`/`archive`/
+     `deduplicate`). Fixed to show accurate, action-specific copy instead.
 
 **Known-good reference for the current style:** `Overview.jsx` and
 `Servers.jsx`.
