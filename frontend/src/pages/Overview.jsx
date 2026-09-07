@@ -81,12 +81,16 @@ export default function Overview() {
     return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
   })[0];
 
-  // Action-required server filtering
+  // Action-required server filtering -- specifically "Underutilized", not
+  // just "not Healthy". A server whose telemetry has simply gone stale
+  // (avg_cpu is null because nothing's arrived in the last 6h) isn't the
+  // same finding as one confirmed underutilized right now; lumping them
+  // together mislabeled stale servers as "Underutilized" in this count.
   const flaggedServers = servers.filter((s) => {
     const t = thresholds[s.server_type];
     const underThreshold = t && s.avg_cpu != null && s.avg_cpu < t.idle_cpu_threshold;
-    const isNotHealthy = s.state && s.state.toLowerCase() !== "healthy";
-    return underThreshold || isNotHealthy;
+    const isUnderutilizedState = s.state && s.state.toLowerCase() === "underutilized";
+    return underThreshold || isUnderutilizedState;
   });
 
   const healthyCount = servers.length - flaggedServers.length;

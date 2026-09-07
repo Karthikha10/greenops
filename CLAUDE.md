@@ -817,6 +817,28 @@ re-verified live:**
     pushing anything — `git merge-base --is-ancestor <your last commit>
     origin/main` tells you immediately whether your history survived or
     was replaced.
+22. **A server with genuinely stale telemetry silently displayed as
+    "Healthy"** — `/servers`' status logic only distinguished "No Data"
+    (never posted, ever) from Healthy/Underutilized; it never checked
+    whether the *latest* reading was actually within the 6h window the
+    idle rule itself uses. With all 4 simulators stopped for a while (a
+    real, recurring situation between work sessions, not a one-off), every
+    server's windowed `avg_cpu` came back `None` — and the code's `else`
+    branch quietly reported "Healthy" for that too, making a dead server
+    and a genuinely-fine one indistinguishable. Fixed by adding a real
+    third state, `"Stale"`, whenever `latest_server` exists but `avg_cpu`
+    (the 6h-windowed average) is `None` — see `list_servers()` in
+    `main.py`. Added matching `.badge.stale`/`.badge.nodata` CSS and a
+    "Stale" option to `Servers.jsx`'s status filter dropdown. Also fixed a
+    follow-on issue this exposed in `Overview.jsx`: its flagged-server
+    count treated *any* non-"Healthy" state as "Underutilized"
+    (`s.state.toLowerCase() !== "healthy"`), which would have mislabeled
+    every stale server as underutilized instead of just uncounted/unknown
+    — narrowed to check specifically for the `"underutilized"` state.
+    **If servers ever look suspiciously uniform again** (all Healthy, all
+    Underutilized, etc.), check `avg_cpu` directly in the API response
+    before trusting the `state` label — a `None` there means "no recent
+    data," not "confirmed fine."
 
 If something looks numerically "off" again, check for the same class of
 issue: an assumption about cadence/scale that isn't actually enforced

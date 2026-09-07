@@ -269,6 +269,7 @@ body {
 
 .badge.healthy { background: var(--success-bg); color: var(--success-text); }
 .badge.idle, .badge.underutilized { background: var(--warn-bg); color: var(--warn-text); }
+.badge.stale, .badge.nodata { background: var(--page-bg); color: var(--text-muted); border: 1px dashed var(--border); }
 .badge.high { background: var(--danger-bg); color: var(--danger-text); }
 .badge.medium { background: var(--warn-bg); color: var(--warn-text); }
 .badge.low { background: var(--success-bg); color: var(--success-text); }

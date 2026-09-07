@@ -207,12 +207,22 @@ def list_servers(db: Session = Depends(get_db)):
             .scalar()
         )
 
+        # "No Data" = never posted anything, ever. "Stale" = has posted
+        # before, but nothing in the last IDLE_LOOKBACK_HOURS -- distinct
+        # from "Healthy", which claims recent telemetry actually looks
+        # fine. Without this, a server that stopped reporting hours ago
+        # (avg_cpu is None because the windowed query finds nothing) fell
+        # through to the same "Healthy" label as a server confirmed fine
+        # right now -- silently indistinguishable from each other.
         state = "No Data"
         cpu_val = None
         if latest_server:
             cpu_val = latest_server.cpu_utilization
-            threshold = rules_engine.get_idle_threshold(s.server_type)
-            state = "Underutilized" if avg_cpu is not None and avg_cpu < threshold else "Healthy"
+            if avg_cpu is None:
+                state = "Stale"
+            else:
+                threshold = rules_engine.get_idle_threshold(s.server_type)
+                state = "Underutilized" if avg_cpu < threshold else "Healthy"
 
         out.append({
             "server_id": s.server_id,

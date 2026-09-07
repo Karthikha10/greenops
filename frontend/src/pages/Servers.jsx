@@ -374,6 +374,8 @@ export default function Servers() {
                 <option value="all">All Statuses</option>
                 <option value="healthy">Healthy</option>
                 <option value="underutilized">Underutilized</option>
+                <option value="stale">Stale</option>
+                <option value="no data">No Data</option>
               </select>
             </div>
 
