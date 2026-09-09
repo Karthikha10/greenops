@@ -1,6 +1,70 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Auth schemas
+# ---------------------------------------------------------------------------
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    name: str
+    role: str
+
+
+class UserOut(BaseModel):
+    id: int
+    employee_id: Optional[str] = None
+    name: str
+    email: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# User management schemas (infra manager only)
+# ---------------------------------------------------------------------------
+
+VALID_ROLES = {"infrastructure_manager", "sustainability_manager", "operations_engineer"}
+
+
+class UserCreateIn(BaseModel):
+    employee_id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=6, max_length=128)
+    role: str
+    is_active: bool = True
+
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate_role
+
+    def validate_role(self) -> "UserCreateIn":
+        if self.role not in VALID_ROLES:
+            raise ValueError(f"role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return self
+
+
+class UserUpdateIn(BaseModel):
+    employee_id: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    email: Optional[str] = Field(default=None, min_length=3, max_length=254)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class ServerTelemetryIn(BaseModel):

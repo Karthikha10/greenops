@@ -149,7 +149,12 @@ def build_feature_rows(rows: Iterable, horizon_minutes: int = FORECAST_HORIZON_M
 
 
 def build_inference_features(rows: Iterable, as_of: Optional[datetime] = None) -> Optional[dict]:
-    """Build the current feature vector for inference, or None when lags are absent."""
+    """Build the current feature vector for inference, or None when lags are absent.
+
+    Falls back gracefully: if the 20-minute lag is unavailable (not enough
+    history yet) but the 15-minute lag exists, the 15-minute value is reused
+    for the 20-minute slot rather than blocking inference entirely.
+    """
     ordered = _as_sorted_rows(rows)
     if not ordered:
         return None
@@ -163,6 +168,11 @@ def build_inference_features(rows: Iterable, as_of: Optional[datetime] = None) -
         )
         for minutes in LAG_MINUTES
     }
+
+    # Graceful fallback: use the next-shorter lag when 20m is unavailable
+    if lag_rows[20] is None and lag_rows[15] is not None:
+        lag_rows[20] = lag_rows[15]
+
     if any(lag_rows[minutes] is None for minutes in LAG_MINUTES):
         return None
 

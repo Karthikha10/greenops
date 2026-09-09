@@ -7,12 +7,49 @@ const client = axios.create({
   timeout: 8000,
 });
 
+// ---------------------------------------------------------------------------
+// Request interceptor — attach JWT from localStorage if present
+// ---------------------------------------------------------------------------
+
+client.interceptors.request.use((config) => {
+  const token = localStorage.getItem("greenops_token");
+  if (token) {
+    config.headers["Authorization"] = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// ---------------------------------------------------------------------------
+// Response interceptor — on 401, clear stored credentials and redirect to /login
+// ---------------------------------------------------------------------------
+
+client.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      // Clear stale auth state
+      localStorage.removeItem("greenops_token");
+      localStorage.removeItem("greenops_user");
+      // Only redirect if we're not already on the login page
+      if (window.location.pathname !== "/login") {
+        window.location.href = "/login";
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 export const api = {
   root: () => client.get("/"),
 
   // ----------------------------------------------------------
-  // SERVERS
+  // AUTH
   // ----------------------------------------------------------
+
+  login: (email, password) =>
+    client.post("/auth/login", { email, password }),
+
+  me: () => client.get("/auth/me"),
 
   servers: () =>
     client.get("/servers"),
@@ -147,6 +184,22 @@ export const api = {
 
   updatePreferences: (weights) =>
     client.put("/preferences", weights),
+
+  // ----------------------------------------------------------
+  // USER MANAGEMENT (infrastructure_manager only)
+  // ----------------------------------------------------------
+
+  listUsers: () =>
+    client.get("/users"),
+
+  createUser: (payload) =>
+    client.post("/users", payload),
+
+  updateUser: (id, payload) =>
+    client.patch(`/users/${id}`, payload),
+
+  deactivateUser: (id) =>
+    client.delete(`/users/${id}`),
 
   // ----------------------------------------------------------
   // ESG REPORT

@@ -6,6 +6,7 @@ import {
   PieChart, Pie,
 } from "recharts";
 import api from "../api";
+import { useAuth } from "../AuthContext";
 
 /* ─── Action metadata ─────────────────────────────────────────── */
 
@@ -160,7 +161,7 @@ function ImpactMiniChart({ imp }) {
 
 /* ─── Single card ─────────────────────────────────────────────── */
 
-function RecCard({ rec, onAction, actLoading }) {
+function RecCard({ rec, onAction, actLoading, canDecide }) {
   const [busy, setBusy] = useState(false);
   const type    = rec.recommendation_type;
   const meta    = ACTION[type] || ACTION.consolidate;
@@ -210,19 +211,27 @@ function RecCard({ rec, onAction, actLoading }) {
         {/* impact chart */}
         <ImpactMiniChart imp={rec.impact || {}} />
 
-        {/* buttons */}
+        {/* buttons — only infrastructure_manager can approve/snooze/dismiss */}
         <div className="rcard-btns">
-          {!blocked && (
-            <button className="rcard-btn accept" disabled={busy || actLoading} onClick={() => act(apiAction)}>
-              ✓ {meta.acceptLabel}
-            </button>
+          {canDecide ? (
+            <>
+              {!blocked && (
+                <button className="rcard-btn accept" disabled={busy || actLoading} onClick={() => act(apiAction)}>
+                  ✓ {meta.acceptLabel}
+                </button>
+              )}
+              <button className="rcard-btn snooze" disabled={busy || actLoading} onClick={() => act("snooze", 24)}>
+                Snooze 24h
+              </button>
+              <button className="rcard-btn dismiss" disabled={busy || actLoading} onClick={() => act("do_nothing")}>
+                Dismiss
+              </button>
+            </>
+          ) : (
+            <span style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>
+              View only — approval requires Infrastructure Manager role
+            </span>
           )}
-          <button className="rcard-btn snooze" disabled={busy || actLoading} onClick={() => act("snooze", 24)}>
-            Snooze 24h
-          </button>
-          <button className="rcard-btn dismiss" disabled={busy || actLoading} onClick={() => act("do_nothing")}>
-            Dismiss
-          </button>
           <Link to={`/recommendations/${rec.id}`} className="rcard-detail-link">
             See full analysis →
           </Link>
@@ -438,6 +447,9 @@ export default function Recommendations() {
     consolidate: recs.filter((r) => r.recommendation_type === "consolidate").length,
     storage:     recs.filter((r) => ["archive", "deduplicate", "rightsize"].includes(r.recommendation_type)).length,
   };
+
+  const { user } = useAuth();
+  const canDecide = user?.role === "infrastructure_manager";
 
   const sortFn = (a, b) => {
     const t = (PRIORITY_TIER[a.priority] ?? 9) - (PRIORITY_TIER[b.priority] ?? 9);
@@ -931,7 +943,7 @@ export default function Recommendations() {
                       <span className="rec-section-divider-count">{consolidateGroup.length}</span>
                     </div>
                     {consolidateGroup.map((rec) => (
-                      <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} />
+                      <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} canDecide={canDecide} />
                     ))}
                   </>
                 )}
@@ -943,14 +955,14 @@ export default function Recommendations() {
                       <span className="rec-section-divider-count">{storageGroup.length}</span>
                     </div>
                     {storageGroup.map((rec) => (
-                      <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} />
+                      <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} canDecide={canDecide} />
                     ))}
                   </>
                 )}
               </>
             ) : (
               sorted.map((rec) => (
-                <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} />
+                <RecCard key={rec.id} rec={rec} onAction={handleAction} actLoading={actLoading} canDecide={canDecide} />
               ))
             )}
           </div>

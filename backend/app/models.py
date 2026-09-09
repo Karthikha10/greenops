@@ -1,6 +1,21 @@
-from sqlalchemy import Column, Integer, Float, String, DateTime
+from sqlalchemy import Column, Integer, Float, String, DateTime, Boolean, ForeignKey
 from datetime import datetime
 from .database import Base
+
+
+class User(Base):
+    """Authenticated GreenOps users with role-based access control."""
+    __tablename__ = "users"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    employee_id   = Column(String, unique=True, index=True, nullable=True)
+    name          = Column(String, nullable=False)
+    email         = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role          = Column(String, nullable=False)
+    # Roles: infrastructure_manager | sustainability_manager | operations_engineer
+    is_active     = Column(Boolean, default=True, nullable=False)
+    created_at    = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Server(Base):
@@ -170,6 +185,11 @@ class OperatorAction(Base):
     # this automatically -- it relies entirely on the operator marking it.
     executed_at = Column(DateTime, nullable=True)
     execution_note = Column(String, nullable=True)
+
+    # Audit trail: which user approved/rejected/snoozed this action.
+    decided_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    decided_by_name    = Column(String, nullable=True)   # snapshot at decision time
+    decided_by_role    = Column(String, nullable=True)   # snapshot at decision time
 
     created_at = Column(
         DateTime,

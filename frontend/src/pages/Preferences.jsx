@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../api";
+import { useAuth } from "../AuthContext";
 
 /* ==========================================================================
    1. CONFIGURATION & FIELD METADATA
@@ -53,7 +54,7 @@ const DEFAULT_WEIGHTS = {
    2. SUB-COMPONENTS
    ========================================================================== */
 
-function WeightSliderCard({ field, value, onChange }) {
+function WeightSliderCard({ field, value, onChange, canEdit }) {
   return (
     <div className="weight-card">
       <div className="weight-card-header">
@@ -76,9 +77,14 @@ function WeightSliderCard({ field, value, onChange }) {
           max="5"
           step="0.1"
           value={value ?? 1.0}
-          onChange={(e) => onChange(field.key, e.target.value)}
+          onChange={(e) => canEdit && onChange(field.key, e.target.value)}
           className="weight-slider"
-          style={{ accentColor: field.color }}
+          style={{
+            accentColor: field.color,
+            opacity: canEdit ? 1 : 0.5,
+            cursor: canEdit ? "pointer" : "not-allowed",
+          }}
+          disabled={!canEdit}
         />
         <div className="slider-ticks">
           <span>0.0 (Ignore)</span>
@@ -100,6 +106,9 @@ export default function Preferences() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+
+  const { user } = useAuth();
+  const canEdit = user?.role === "infrastructure_manager";
 
   useEffect(() => {
     let active = true;
@@ -364,6 +373,15 @@ export default function Preferences() {
           <>
             <div className="section-block">
               <p className="section-label">Ranking Coefficients</p>
+              {!canEdit && (
+                <div style={{
+                  fontSize: 13, color: "var(--text-secondary)",
+                  background: "#F4F8F6", border: "1px solid #DCEFE7",
+                  borderRadius: 8, padding: "10px 14px", marginBottom: 16,
+                }}>
+                  View only — modifying recommendation weights requires the Infrastructure Manager role.
+                </div>
+              )}
               <div className="weights-grid">
                 {WEIGHT_FIELDS.map((field) => (
                   <WeightSliderCard
@@ -371,11 +389,13 @@ export default function Preferences() {
                     field={field}
                     value={weights[field.key]}
                     onChange={handleChange}
+                    canEdit={canEdit}
                   />
                 ))}
               </div>
             </div>
 
+            {canEdit && (
             <div className="actions-card">
               <div>
                 {saved ? (
@@ -408,6 +428,7 @@ export default function Preferences() {
                 </button>
               </div>
             </div>
+            )}
 
             <div className="info-note">
               <strong>Ranking Formula:</strong> Scores are calculated as{" "}

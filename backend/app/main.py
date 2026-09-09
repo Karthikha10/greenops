@@ -9,7 +9,7 @@ Covers:
   - CPU-estimation ML model (validation layer) + evaluation metrics endpoint
 
 Run:
-    uvicorn app.main:app --reload
+    uvicorn app.main:app --reload --env-file .env
 """
 import json
 import os
@@ -17,10 +17,15 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
+# Load .env before anything reads os.getenv()
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
 import joblib
 import pandas as pd
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -32,6 +37,12 @@ from . import (
     recommendations,
 )
 from .database import engine, get_db, Base
+from .auth import (
+    get_current_user,
+    require_role,
+    verify_password,
+    create_access_token,
+)
 
 Base.metadata.create_all(bind=engine)
 
@@ -43,6 +54,174 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Authentication routes
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/login", response_model=schemas.TokenOut)
+def login(payload: schemas.LoginIn, db: Session = Depends(get_db)):
+    """
+    Authenticate with email + password.
+    Returns a JWT access token on success; 401 on invalid credentials.
+    """
+    user = db.query(models.User).filter(
+        models.User.email == payload.email.lower().strip()
+    ).first()
+
+    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(user.id, user.role, user.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "name": user.name,
+        "role": user.role,
+    }
+
+
+@app.get("/auth/me", response_model=schemas.UserOut)
+def me(current_user: models.User = Depends(get_current_user)):
+    """Return the currently authenticated user's profile."""
+    return current_user
+
+
+# ---------------------------------------------------------------------------
+# User management (infrastructure_manager only)
+# ---------------------------------------------------------------------------
+
+def _user_to_dict(u: models.User) -> dict:
+    return {
+        "id": u.id,
+        "employee_id": u.employee_id,
+        "name": u.name,
+        "email": u.email,
+        "role": u.role,
+        "is_active": u.is_active,
+        "created_at": u.created_at.isoformat(),
+    }
+
+
+@app.get("/users")
+def list_users(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(require_role("infrastructure_manager")),
+):
+    """Return all users. Infrastructure Manager only."""
+    users = db.query(models.User).order_by(models.User.created_at.asc()).all()
+    return [_user_to_dict(u) for u in users]
+
+
+@app.post("/users", status_code=201)
+def create_user(
+    payload: schemas.UserCreateIn,
+    db: Session = Depends(get_db),
+    _: models.User = Depends(require_role("infrastructure_manager")),
+):
+    """Create a new GreenOps user. Infrastructure Manager only."""
+    from .auth import hash_password, ROLES
+
+    # Validate role
+    if payload.role not in ROLES:
+        raise HTTPException(status_code=422, detail=f"Invalid role. Must be one of: {', '.join(sorted(ROLES))}")
+
+    # Check email uniqueness
+    if db.query(models.User).filter(models.User.email == payload.email.lower().strip()).first():
+        raise HTTPException(status_code=409, detail="A user with this email already exists.")
+
+    # Check employee_id uniqueness if provided
+    if payload.employee_id:
+        if db.query(models.User).filter(models.User.employee_id == payload.employee_id.strip()).first():
+            raise HTTPException(status_code=409, detail="A user with this employee ID already exists.")
+
+    user = models.User(
+        employee_id=payload.employee_id.strip() if payload.employee_id else None,
+        name=payload.name.strip(),
+        email=payload.email.lower().strip(),
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+        is_active=payload.is_active,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_to_dict(user)
+
+
+@app.patch("/users/{user_id}")
+def update_user(
+    user_id: int,
+    payload: schemas.UserUpdateIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("infrastructure_manager")),
+):
+    """Update a user's details or role. Infrastructure Manager only."""
+    from .auth import hash_password, ROLES
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if payload.employee_id is not None:
+        emp_id = payload.employee_id.strip() if payload.employee_id else None
+        if emp_id:
+            conflict = db.query(models.User).filter(
+                models.User.employee_id == emp_id,
+                models.User.id != user_id,
+            ).first()
+            if conflict:
+                raise HTTPException(status_code=409, detail="Employee ID already in use.")
+        user.employee_id = emp_id
+
+    if payload.name is not None:
+        user.name = payload.name.strip()
+
+    if payload.email is not None:
+        new_email = payload.email.lower().strip()
+        conflict = db.query(models.User).filter(
+            models.User.email == new_email,
+            models.User.id != user_id,
+        ).first()
+        if conflict:
+            raise HTTPException(status_code=409, detail="Email already in use.")
+        user.email = new_email
+
+    if payload.password is not None:
+        user.password_hash = hash_password(payload.password)
+
+    if payload.role is not None:
+        if payload.role not in ROLES:
+            raise HTTPException(status_code=422, detail=f"Invalid role.")
+        user.role = payload.role
+
+    if payload.is_active is not None:
+        user.is_active = payload.is_active
+
+    db.commit()
+    db.refresh(user)
+    return _user_to_dict(user)
+
+
+@app.delete("/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("infrastructure_manager")),
+):
+    """Deactivate (soft-delete) a user. Infrastructure Manager only."""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user.is_active = False
+    db.commit()
 
 TARIFF_PER_KWH = 8.0          # placeholder tariff, currency-agnostic
 CARBON_INTENSITY_KG_PER_KWH = 0.5   # placeholder regional average, see notes
@@ -574,10 +753,12 @@ def recommendation_action(
     recommendation_id: int,
     payload: schemas.OperatorActionIn,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("infrastructure_manager")),
 ):
     """
     Record the operator's decision.
 
+    RBAC: infrastructure_manager only. Returns 403 for all other roles.
     This does NOT actually modify infrastructure.
     """
 
@@ -614,6 +795,12 @@ def recommendation_action(
             detail=str(exc),
         )
 
+    # Audit trail: stamp who made the decision
+    action.decided_by_user_id = current_user.id
+    action.decided_by_name    = current_user.name
+    action.decided_by_role    = current_user.role
+    db.commit()
+
     return {
         "status": "recorded",
         "recommendation_id": recommendation.id,
@@ -621,6 +808,7 @@ def recommendation_action(
         "action": action.action,
         "recommendation_status": recommendation.status,
         "snoozed_until": recommendation.snoozed_until.isoformat() if recommendation.snoozed_until else None,
+        "decided_by": current_user.name,
         "message": (
             "Operator decision recorded. "
             "No physical infrastructure change was performed."
@@ -646,7 +834,11 @@ def get_preferences(db: Session = Depends(get_db)):
 
 
 @app.put("/preferences")
-def update_preferences(payload: schemas.PreferencesIn, db: Session = Depends(get_db)):
+def update_preferences(
+    payload: schemas.PreferencesIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("infrastructure_manager")),
+):
     prefs = recommendations.get_preferences(db)
     prefs.energy_weight = payload.energy_weight
     prefs.cost_weight = payload.cost_weight
@@ -690,6 +882,8 @@ def operator_actions(
             "created_at": row.created_at.isoformat(),
             "executed_at": row.executed_at.isoformat() if row.executed_at else None,
             "execution_note": row.execution_note,
+            "decided_by_name": row.decided_by_name,
+            "decided_by_role": row.decided_by_role,
         }
         for row in rows
     ]
@@ -700,15 +894,13 @@ def update_operator_action(
     action_id: int,
     payload: dict,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("infrastructure_manager", "operations_engineer")),
 ):
     """
     Mark an approved operator action as executed (or clear execution).
 
+    RBAC: infrastructure_manager and operations_engineer.
     Accepts JSON body: { "executed": true/false, "execution_note": "..." }
-
-    This is the only mutation allowed on an existing OperatorAction. It
-    records that the operator has manually confirmed the action was
-    carried out -- GreenOps cannot verify this automatically.
     """
     row = db.query(models.OperatorAction).filter(models.OperatorAction.id == action_id).first()
     if row is None:

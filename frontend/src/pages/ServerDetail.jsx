@@ -224,10 +224,15 @@ export default function ServerDetail() {
     };
   }, [id, horizon]);
 
-  const cpuData = useMemo(
-    () => windowData(rawHistory, cpuHours),
-    [rawHistory, cpuHours]
-  );
+  const cpuData = useMemo(() => {
+    const windowed = windowData(rawHistory, cpuHours);
+    // Downsample to at most 120 points so the chart stays readable.
+    // Keep forecast points (if any) intact — only thin historical readings.
+    const MAX_POINTS = 120;
+    if (windowed.length <= MAX_POINTS) return windowed;
+    const step = Math.ceil(windowed.length / MAX_POINTS);
+    return windowed.filter((_, i) => i % step === 0 || i === windowed.length - 1);
+  }, [rawHistory, cpuHours]);
 
   const latest =
     rawHistory.length > 0

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import api from "../api";
+import { useAuth } from "../AuthContext";
 
 /* ─── Helpers ─────────────────────────────────────────────────── */
 
@@ -25,7 +26,7 @@ function timeAgo(iso) {
 
 /* ─── Single action row ───────────────────────────────────────── */
 
-function ActionRow({ row, onMarkExecuted, onDismiss }) {
+function ActionRow({ row, onMarkExecuted, onDismiss, canDecide }) {
   const [busy,  setBusy]  = useState(false);
   const [note,  setNote]  = useState(row.execution_note || "");
   const [editingNote, setEditingNote] = useState(false);
@@ -81,6 +82,13 @@ function ActionRow({ row, onMarkExecuted, onDismiss }) {
           </div>
         )}
 
+        {/* Approved by — audit trail */}
+        {row.decided_by_name && (
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 10 }}>
+            Approved by: <strong style={{ color: "var(--text-secondary)" }}>{row.decided_by_name}</strong>
+          </div>
+        )}
+
         {/* Execution note */}
         {isExecuted && (
           <div className="aa-exec-detail">
@@ -124,37 +132,45 @@ function ActionRow({ row, onMarkExecuted, onDismiss }) {
 
         {/* Actions */}
         <div className="aa-actions">
-          {!isExecuted && (
-            <button
-              className="aa-btn primary"
-              disabled={busy}
-              onClick={() => handle(async () => {
-                await api.operatorActionUpdate(row.id, { executed: true });
-                onMarkExecuted(row.id, true, null);
-              })}
-            >
-              ✓ Mark as executed
-            </button>
+          {canDecide ? (
+            <>
+              {!isExecuted && (
+                <button
+                  className="aa-btn primary"
+                  disabled={busy}
+                  onClick={() => handle(async () => {
+                    await api.operatorActionUpdate(row.id, { executed: true });
+                    onMarkExecuted(row.id, true, null);
+                  })}
+                >
+                  ✓ Mark as executed
+                </button>
+              )}
+              {isExecuted && (
+                <button
+                  className="aa-btn secondary"
+                  disabled={busy}
+                  onClick={() => handle(async () => {
+                    await api.operatorActionUpdate(row.id, { executed: false });
+                    onMarkExecuted(row.id, false, null);
+                  })}
+                >
+                  Undo execution
+                </button>
+              )}
+              <button
+                className="aa-btn ghost"
+                disabled={busy}
+                onClick={() => handle(() => onDismiss(row.id))}
+              >
+                Remove from log
+              </button>
+            </>
+          ) : (
+            <span style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>
+              View only — marking as executed requires Infrastructure Manager role
+            </span>
           )}
-          {isExecuted && (
-            <button
-              className="aa-btn secondary"
-              disabled={busy}
-              onClick={() => handle(async () => {
-                await api.operatorActionUpdate(row.id, { executed: false });
-                onMarkExecuted(row.id, false, null);
-              })}
-            >
-              Undo execution
-            </button>
-          )}
-          <button
-            className="aa-btn ghost"
-            disabled={busy}
-            onClick={() => handle(() => onDismiss(row.id))}
-          >
-            Remove from log
-          </button>
           <Link to={`/recommendations/${row.recommendation_id}`} className="aa-detail-link">
             View original analysis →
           </Link>
@@ -171,6 +187,11 @@ export default function ApprovedActions() {
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState("");
   const [filter,   setFilter]   = useState("all"); // all | pending | executed
+
+  const { user } = useAuth();
+  // Both infrastructure_manager and operations_engineer can mark actions as executed.
+  // Only infrastructure_manager can approve/reject/snooze recommendations (enforced separately).
+  const canMarkExecuted = user?.role === "infrastructure_manager" || user?.role === "operations_engineer";
 
   const load = useCallback(async () => {
     try {
@@ -521,6 +542,7 @@ export default function ApprovedActions() {
               row={row}
               onMarkExecuted={handleMarkExecuted}
               onDismiss={handleDismiss}
+              canDecide={canMarkExecuted}
             />
           ))
         )}

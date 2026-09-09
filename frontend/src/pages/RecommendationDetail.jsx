@@ -7,6 +7,7 @@ import {
   ResponsiveContainer, CartesianGrid,
 } from "recharts";
 import api from "../api";
+import { useAuth } from "../AuthContext";
 
 /* ─── Helpers ─────────────────────────────────────────────────── */
 
@@ -649,6 +650,9 @@ export default function RecommendationDetail() {
   const isStorage     = ["archive", "deduplicate", "rightsize"].includes(rec.recommendation_type);
   const rejected      = isConsolidate && baseImpact.safe === false;
 
+  const { user } = useAuth();
+  const canDecide = user?.role === "infrastructure_manager";
+
   // Parse server type from the explanation string — backend always writes
   // "threshold for TYPE:" in the explanation for consolidation recs.
   const serverTypeMatch = rec.explanation?.match(/threshold for ([^:]+):/i);
@@ -1149,30 +1153,36 @@ export default function RecommendationDetail() {
         )}
       </div>
 
-      {/* Decision */}
+      {/* Decision — infrastructure_manager only */}
       <div className="rd-card">
         <p className="rd-card-title">Decision</p>
         <p className="rd-card-sub" style={{ marginBottom: 16 }}>
           Recording a decision here marks this recommendation as resolved and removes it from the queue.
           {isUsingAlternate && <> You have selected <strong>{effectiveImpact?.target_server_id}</strong> as the target.</>}
         </p>
-        <div className="rd-decision-row">
-          {(!isConsolidate || !rejected) && (
-            <button
-              className="rd-btn-primary"
-              onClick={() => handleAction(acceptActionFor(rec.recommendation_type))}
-              disabled={actLoad}
-            >
-              ✓ {acceptLabelFor(rec.recommendation_type)}{isUsingAlternate ? ` to ${effectiveImpact?.target_server_id}` : ""}
+        {canDecide ? (
+          <div className="rd-decision-row">
+            {(!isConsolidate || !rejected) && (
+              <button
+                className="rd-btn-primary"
+                onClick={() => handleAction(acceptActionFor(rec.recommendation_type))}
+                disabled={actLoad}
+              >
+                ✓ {acceptLabelFor(rec.recommendation_type)}{isUsingAlternate ? ` to ${effectiveImpact?.target_server_id}` : ""}
+              </button>
+            )}
+            <button className="rd-btn-secondary" onClick={() => handleAction("snooze", 24)} disabled={actLoad}>
+              ⏱ Snooze 24h
             </button>
-          )}
-          <button className="rd-btn-secondary" onClick={() => handleAction("snooze", 24)} disabled={actLoad}>
-            ⏱ Snooze 24h
-          </button>
-          <button className="rd-btn-danger" onClick={() => handleAction("do_nothing")} disabled={actLoad}>
-            Dismiss
-          </button>
-        </div>
+            <button className="rd-btn-danger" onClick={() => handleAction("do_nothing")} disabled={actLoad}>
+              Dismiss
+            </button>
+          </div>
+        ) : (
+          <p style={{ fontSize: 13, color: "var(--text-muted)", fontStyle: "italic", margin: 0 }}>
+            View only — approving or dismissing recommendations requires the Infrastructure Manager role.
+          </p>
+        )}
       </div>
     </>
   );
