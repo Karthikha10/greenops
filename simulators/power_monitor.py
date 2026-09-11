@@ -17,6 +17,16 @@ branch: since server_monitor.py already gives it a very low workload bias,
 its power now naturally comes out low too, for the same reason a real idle
 server would draw less power.
 
+The facility overhead ratio (IT power -> facility power, i.e. what PUE
+actually measures) is likewise generated from the server's current
+cooling_efficiency (also fetched from GET /servers, posted by
+cooling_monitor.py) instead of a pure random draw -- worse cooling
+efficiency now means worse (higher) overhead, the same real relationship
+PUE is supposed to reflect. This was the one gap left in the original power
+fix: it_power_kw responded to load, but PUE still didn't respond to
+anything, so it stayed exactly as uninformative to the CPU/power validation
+models as before that fix.
+
 Usage:
     python power_monitor.py
 """
@@ -46,6 +56,19 @@ NOISE_KW = 0.15
 # very first cycle, before server_monitor.py has posted anything for it).
 FALLBACK_CPU_PERCENT = 20.0
 FALLBACK_MEMORY_PERCENT = 20.0
+FALLBACK_COOLING_EFFICIENCY = 0.82
+
+# Facility overhead (IT power -> facility power -> PUE). Base is the
+# best-case overhead at near-perfect cooling efficiency; the penalty scales
+# up linearly as efficiency drops toward its worst observed floor (0.4, see
+# cooling_monitor.py). Chosen so the overall PUE range matches what this
+# simulator always produced (roughly 1.15-1.55) -- only the relationship to
+# cooling is new.
+BASE_OVERHEAD_RATIO = 1.15
+MAX_OVERHEAD_PENALTY = 0.40
+OVERHEAD_NOISE = 0.03
+WORST_COOLING_EFFICIENCY = 0.4
+BEST_COOLING_EFFICIENCY = 0.99
 
 
 def get_current_load():
@@ -64,14 +87,17 @@ def get_current_load():
     return {}
 
 
-def generate_reading(server_id, cpu, memory):
+def generate_reading(server_id, cpu, memory, cooling_efficiency):
     """
     Generate IT and facility power for one server, given its current
-    CPU/memory utilization.
+    CPU/memory utilization and cooling efficiency.
     """
 
     cpu = FALLBACK_CPU_PERCENT if cpu is None else cpu
     memory = FALLBACK_MEMORY_PERCENT if memory is None else memory
+    cooling_efficiency = (
+        FALLBACK_COOLING_EFFICIENCY if cooling_efficiency is None else cooling_efficiency
+    )
 
     cpu_fraction = max(0.0, min(1.0, cpu / 100.0))
     memory_fraction = max(0.0, min(1.0, memory / 100.0))
@@ -88,10 +114,13 @@ def generate_reading(server_id, cpu, memory):
         2,
     )
 
-    # Facility overhead factor -> PUE
-    overhead_ratio = random.uniform(
-        1.15,
-        1.55
+    # Facility overhead factor -> PUE. Worse cooling efficiency pushes this
+    # up (more overhead per unit of IT power delivered), not a random draw.
+    efficiency = max(WORST_COOLING_EFFICIENCY, min(BEST_COOLING_EFFICIENCY, cooling_efficiency))
+    penalty_fraction = (BEST_COOLING_EFFICIENCY - efficiency) / (BEST_COOLING_EFFICIENCY - WORST_COOLING_EFFICIENCY)
+    overhead_ratio = max(
+        1.05,
+        BASE_OVERHEAD_RATIO + MAX_OVERHEAD_PENALTY * penalty_fraction + random.uniform(-OVERHEAD_NOISE, OVERHEAD_NOISE),
     )
 
     facility_power = round(
@@ -141,6 +170,7 @@ def main():
                 sid,
                 server_info.get("cpu"),
                 server_info.get("memory"),
+                server_info.get("cooling_efficiency"),
             )
 
             try:

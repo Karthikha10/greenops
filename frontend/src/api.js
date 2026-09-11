@@ -67,7 +67,7 @@ export const api = {
 
   serverForecast: (
     id,
-    horizonMinutes = 15
+    horizonMinutes = 60
   ) =>
     client.get(`/servers/${id}/forecast`, {
       params: {

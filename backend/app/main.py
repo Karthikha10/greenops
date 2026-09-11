@@ -373,6 +373,7 @@ def list_servers(db: Session = Depends(get_db)):
     for s in servers:
         latest_server = _latest(db, models.ServerTelemetry, s.server_id)
         latest_power = _latest(db, models.PowerTelemetry, s.server_id)
+        latest_cooling = _latest(db, models.CoolingTelemetry, s.server_id)
 
         # Matches rules_engine.check_idle_server exactly: same lookback window,
         # same threshold source. The state badge must agree with the flag that
@@ -414,6 +415,12 @@ def list_servers(db: Session = Depends(get_db)):
             "avg_cpu": round(avg_cpu, 2) if avg_cpu else None,
             "it_power_kw": latest_power.it_power_kw if latest_power else None,
             "facility_power_kw": latest_power.facility_power_kw if latest_power else None,
+            # cooling_efficiency exposed here (not just on /servers/{id}/detail) so
+            # power_monitor.py can read it in the same bulk GET /servers call it
+            # already makes for CPU/memory, without an extra per-server request --
+            # see power_monitor.py's overhead_ratio, which now derives PUE from
+            # this instead of a random draw.
+            "cooling_efficiency": latest_cooling.cooling_efficiency if latest_cooling else None,
             "state": state,
         })
     return out
@@ -529,7 +536,7 @@ def server_prediction(server_id: str, db: Session = Depends(get_db)):
         "server_type": server_meta.server_type,
         "cooling_type": server_meta.cooling_type,
         "datacenter_region": server_meta.datacenter_region,
-        "time_of_day": "Peak",
+        "time_of_day": rules_engine.get_time_of_day(latest_server.timestamp),
     }])
 
     predicted_cpu = float(_cpu_model.predict(features)[0])
@@ -553,10 +560,13 @@ def server_prediction(server_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/servers/{server_id}/forecast")
-def server_forecast(server_id: str, horizon_minutes: int = 15, db: Session = Depends(get_db)):
+def server_forecast(server_id: str, horizon_minutes: int = 60, db: Session = Depends(get_db)):
     """Forecast near-term CPU/workload only for idle or underutilized servers."""
-    if horizon_minutes not in (15, 30, 60):
-        raise HTTPException(status_code=422, detail="horizon_minutes must be 15, 30, or 60")
+    if horizon_minutes not in forecasting.OPERATOR_HORIZONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"horizon_minutes must be one of {forecasting.OPERATOR_HORIZONS} (60=1h, 360=6h, 1440=24h)",
+        )
 
     server = db.query(models.Server).filter(models.Server.server_id == server_id).first()
     if server is None:
@@ -571,7 +581,6 @@ def server_forecast(server_id: str, horizon_minutes: int = 15, db: Session = Dep
         horizon_minutes=result["horizon_minutes"],
         measured_cpu=result["measured_cpu"],
         predicted_cpu=result["predicted_cpu"],
-        predicted_power_kw=None,
         method=result["method"],
         model_version=result.get("model_version"),
         validation_mae=result.get("validation_mae"),
@@ -672,7 +681,6 @@ def list_recommendations(
             "server_id": row.server_id,
             "recommendation_type": row.recommendation_type,
             "priority": row.priority,
-            "title": row.title,
             "explanation": row.explanation,
             "status": row.status,
             "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -704,7 +712,6 @@ def get_recommendation(recommendation_id: int, db: Session = Depends(get_db)):
         "server_id": row.server_id,
         "recommendation_type": row.recommendation_type,
         "priority": row.priority,
-        "title": row.title,
         "explanation": row.explanation,
         "status": row.status,
         "created_at": row.created_at.isoformat() if row.created_at else None,

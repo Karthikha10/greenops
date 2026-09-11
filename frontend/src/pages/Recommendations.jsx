@@ -17,6 +17,25 @@ const ACTION = {
   deduplicate: { verb: "Remove duplicate files",  icon: "⊘", acceptLabel: "Approve deduplication" },
 };
 
+/* ─── Target forecast (CPU) ───────────────────────────────────── */
+// Single scannable number, not the full explanation -- the ranked candidate
+// table with the "Risky soon" badge and forecast reasoning still only lives
+// on the detail page. This just surfaces the winning candidate's own
+// current -> predicted CPU so triage doesn't require opening every card.
+function targetForecast(rec) {
+  const target = rec.impact?.target_server_id;
+  const candidates = rec.impact?.candidates || [];
+  if (!target) return null;
+  const match = candidates.find((c) => c.server_id === target);
+  if (!match || match.forecast_predicted_cpu == null || match.current_cpu == null) return null;
+  const delta = match.forecast_predicted_cpu - match.current_cpu;
+  return {
+    measured: match.current_cpu,
+    predicted: match.forecast_predicted_cpu,
+    arrow: delta > 0.5 ? "▲" : delta < -0.5 ? "▼" : "▬",
+  };
+}
+
 /* ─── Plain-language "why" ────────────────────────────────────── */
 
 function buildWhy(rec) {
@@ -170,6 +189,7 @@ function RecCard({ rec, onAction, actLoading, canDecide }) {
   const target  = rec.impact?.target_server_id;
   const blocked = type === "consolidate" && rec.impact?.safe === false;
   const apiAction = type === "consolidate" ? "consolidate" : "rightsize";
+  const tf = type === "consolidate" ? targetForecast(rec) : null;
 
   const act = async (action, snoozeHours) => {
     setBusy(true);
@@ -202,6 +222,14 @@ function RecCard({ rec, onAction, actLoading, canDecide }) {
           )}
           {blocked && (
             <span className="rcard-blocked-badge">⚠ no safe target right now</span>
+          )}
+          {tf && (
+            <span
+              className="rcard-target-badge"
+              title={`${target}'s own current → predicted CPU, independent of this move`}
+            >
+              Target forecast: {tf.measured}% {tf.arrow} {tf.predicted}%
+            </span>
           )}
         </div>
 

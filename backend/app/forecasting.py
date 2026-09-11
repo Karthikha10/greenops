@@ -30,6 +30,46 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "ml_artifacts")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 METRICS_PATH = os.path.join(MODEL_DIR, METRICS_FILENAME)
 
+# ---------------------------------------------------------------------------
+# Operator-facing horizons (Server Detail's "Workload projection" dropdown).
+#
+# FORECAST_HORIZON_MINUTES (15, above) stays exactly as it was -- it is the
+# horizon recommendations.py's consolidation safety check is built and
+# tested against (forecast_candidate_server() is called with no explicit
+# horizon, so it always resolves to this constant). Never repoint that
+# constant at a different horizon; add new ones instead, as below.
+#
+# 1h gets its own trained lagged-feature model, same architecture as the
+# 15-minute one, just retargeted 60 minutes out (build_feature_rows already
+# takes horizon_minutes as a parameter, so no new training code is needed,
+# only a second trained artifact).
+#
+# 6h and 24h do NOT get trained models. Two honest reasons: (1) as of this
+# writing there are only a few days of real, gappy live telemetry -- nowhere
+# near enough to learn a real 6h/24h-ahead relationship, and (2) even with
+# more data, each server's workload here is generated from a fixed per-server
+# "bias" (see server_monitor.py) that does not drift or cycle over time --
+# the statistically honest estimate for a near-stationary series that far
+# out is reversion to its own recent average, not a lagged regression or a
+# straight-line extrapolation of the last few minutes. See
+# long_horizon_forecast() below.
+LONG_FORECAST_HORIZON_MINUTES = 60
+MEDIUM_HORIZON_MINUTES = 360
+FAR_HORIZON_MINUTES = 1440
+OPERATOR_HORIZONS = (LONG_FORECAST_HORIZON_MINUTES, MEDIUM_HORIZON_MINUTES, FAR_HORIZON_MINUTES)
+
+LONG_MODEL_FILENAME = "workload_forecast_1h_model.joblib"
+LONG_METRICS_FILENAME = "forecast_1h_metrics.json"
+LONG_MODEL_PATH = os.path.join(MODEL_DIR, LONG_MODEL_FILENAME)
+LONG_METRICS_PATH = os.path.join(MODEL_DIR, LONG_METRICS_FILENAME)
+
+# long_horizon_forecast() gating -- refuse to answer rather than guess from
+# too little history. Needs real coverage of at least half the requested
+# window, and a minimum sample count so a couple of stray readings can't
+# pass as a "24-hour average".
+MIN_LONG_HORIZON_COVERAGE_RATIO = 0.5
+MIN_LONG_HORIZON_SAMPLES = 10
+
 # Memory forecast -- same lag-feature approach and training data as the CPU
 # forecast (train_workload_forecast.py trains both from the same samples),
 # kept as a separate model file/metrics rather than a multi-output model so
@@ -298,7 +338,110 @@ def load_forecast_memory_metrics() -> dict:
         return json.load(file)
 
 
-def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_MINUTES) -> dict:
+def load_long_forecast_model():
+    if not os.path.exists(LONG_MODEL_PATH):
+        return None
+    return joblib.load(LONG_MODEL_PATH)
+
+
+def load_long_forecast_metrics() -> dict:
+    if not os.path.exists(LONG_METRICS_PATH):
+        return {}
+    with open(LONG_METRICS_PATH) as file:
+        return json.load(file)
+
+
+def long_horizon_forecast(
+    rows: Iterable,
+    horizon_minutes: int,
+    field: str = "cpu_utilization",
+) -> dict:
+    """
+    Honest multi-hour fallback -- used for the 6h/24h tiers, which have no
+    trained model (see the OPERATOR_HORIZONS comment above).
+
+    Rather than a straight-line extrapolation of the last few minutes (fine
+    for a 15-60 minute horizon, actively misleading over 6-24 hours on a
+    series that doesn't trend), this reverts to the average of `field` over
+    however much real history falls inside the requested window. That's the
+    statistically defensible estimate for a near-stationary series -- and it
+    refuses to answer at all when there isn't enough real coverage of that
+    window yet, rather than confidently averaging three readings and calling
+    it a 24-hour outlook.
+    """
+    ordered = _as_sorted_rows(rows)
+    if not ordered:
+        return {
+            "predicted_value": None,
+            "trend": "unknown",
+            "lookback_hours_used": 0.0,
+            "coverage_ratio": 0.0,
+            "sample_count": 0,
+        }
+
+    current = ordered[-1]
+    lookback_cutoff = current.timestamp - timedelta(minutes=horizon_minutes)
+    window = [row for row in ordered if row.timestamp >= lookback_cutoff]
+    span_minutes = (
+        (current.timestamp - window[0].timestamp).total_seconds() / 60
+        if window
+        else 0.0
+    )
+    coverage_ratio = span_minutes / horizon_minutes if horizon_minutes else 0.0
+
+    if len(window) < MIN_LONG_HORIZON_SAMPLES or coverage_ratio < MIN_LONG_HORIZON_COVERAGE_RATIO:
+        return {
+            "predicted_value": None,
+            "trend": "unknown",
+            "lookback_hours_used": round(span_minutes / 60, 2),
+            "coverage_ratio": round(coverage_ratio, 2),
+            "sample_count": len(window),
+        }
+
+    values = [getattr(row, field) for row in window if getattr(row, field) is not None]
+    if not values:
+        return {
+            "predicted_value": None,
+            "trend": "unknown",
+            "lookback_hours_used": round(span_minutes / 60, 2),
+            "coverage_ratio": round(coverage_ratio, 2),
+            "sample_count": len(window),
+        }
+
+    avg_value = sum(values) / len(values)
+    current_value = getattr(current, field)
+    trend = (
+        "rising" if current_value > avg_value + 2
+        else "falling" if current_value < avg_value - 2
+        else "stable"
+    )
+    return {
+        "predicted_value": round(float(avg_value), 2),
+        "trend": trend,
+        "lookback_hours_used": round(span_minutes / 60, 2),
+        "coverage_ratio": round(coverage_ratio, 2),
+        "sample_count": len(window),
+    }
+
+
+def forecast_server(db, server_id: str, horizon_minutes: int = LONG_FORECAST_HORIZON_MINUTES) -> dict:
+    """
+    Operator-facing forecast for Server Detail's "Workload projection" card.
+
+    Three tiers, each answered honestly rather than forcing one method onto
+    all of them:
+      - 1h  (LONG_FORECAST_HORIZON_MINUTES): a trained lagged-feature model
+        when enough history exists, else transparent short-horizon trend
+        extrapolation.
+      - 6h / 24h (MEDIUM_HORIZON_MINUTES / FAR_HORIZON_MINUTES): no trained
+        model -- see long_horizon_forecast()'s docstring for why a windowed
+        historical average is the honest answer at this range, and why it
+        refuses to answer when there isn't enough real coverage yet.
+
+    Not used by the consolidation safety check -- that always calls
+    forecast_candidate_server() with no horizon argument, which resolves to
+    the untouched FORECAST_HORIZON_MINUTES=15 constant and its own model.
+    """
     eligibility = idle_eligibility(db, server_id)
     if not eligibility["eligible"]:
         return {
@@ -313,29 +456,59 @@ def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_
         .order_by(models.ServerTelemetry.timestamp.asc())
         .all()
     )
-    model = load_forecast_model()
-    metrics = load_forecast_metrics()
-    live_features = build_inference_features(rows)
-    method = "trend_extrapolation"
-    model_version = None
-    validation = {}
-
-    predicted_cpu = None
-    if model is not None and live_features is not None and horizon_minutes == FORECAST_HORIZON_MINUTES:
-        predicted_cpu = float(model.predict([[live_features[column] for column in FEATURE_COLUMNS]])[0])
-        predicted_cpu = max(0.0, min(100.0, predicted_cpu))
-        method = metrics.get("selected_model", "lagged_model")
-        model_version = metrics.get("model_version", "workload-forecast-v1")
-        validation = metrics.get("selected_metrics", {})
-    else:
-        fallback = trend_forecast(rows, horizon_minutes=horizon_minutes, field="cpu_utilization")
-        predicted_cpu = fallback["predicted_value"]
-        method = "trend_extrapolation"
-        trend = fallback["trend"]
-
     current = rows[-1]
-    if method != "trend_extrapolation":
-        trend = "rising" if predicted_cpu > current.cpu_utilization + 0.5 else "falling" if predicted_cpu < current.cpu_utilization - 0.5 else "stable"
+    method_version = None
+    validation = {}
+    lookback_hours_used = None
+    coverage_ratio = None
+    model_ready = False
+
+    if horizon_minutes == LONG_FORECAST_HORIZON_MINUTES:
+        model = load_long_forecast_model()
+        metrics = load_long_forecast_metrics()
+        live_features = build_inference_features(rows)
+        if model is not None and live_features is not None:
+            predicted_cpu = float(model.predict([[live_features[column] for column in FEATURE_COLUMNS]])[0])
+            predicted_cpu = max(0.0, min(100.0, predicted_cpu))
+            method = metrics.get("selected_model", "lagged_model")
+            method_version = metrics.get("model_version", "workload-forecast-v1")
+            validation = metrics.get("selected_metrics", {})
+            model_ready = True
+            trend = "rising" if predicted_cpu > current.cpu_utilization + 0.5 else "falling" if predicted_cpu < current.cpu_utilization - 0.5 else "stable"
+        else:
+            fallback = trend_forecast(rows, horizon_minutes=horizon_minutes, field="cpu_utilization")
+            predicted_cpu = fallback["predicted_value"]
+            method = "trend_extrapolation"
+            trend = fallback["trend"]
+
+    elif horizon_minutes in (MEDIUM_HORIZON_MINUTES, FAR_HORIZON_MINUTES):
+        result = long_horizon_forecast(rows, horizon_minutes=horizon_minutes, field="cpu_utilization")
+        predicted_cpu = result["predicted_value"]
+        trend = result["trend"]
+        lookback_hours_used = result["lookback_hours_used"]
+        coverage_ratio = result["coverage_ratio"]
+        method = "historical_average" if predicted_cpu is not None else "insufficient_history"
+
+    else:
+        raise ValueError(f"Unsupported operator horizon_minutes: {horizon_minutes}")
+
+    if predicted_cpu is None:
+        return {
+            "server_id": server_id,
+            "eligible": True,
+            "reason": eligibility["reason"],
+            "avg_cpu_lookback": eligibility["avg_cpu"],
+            "idle_threshold": eligibility["idle_threshold"],
+            "horizon_minutes": horizon_minutes,
+            "measured_cpu": round(float(current.cpu_utilization), 2),
+            "predicted_cpu": None,
+            "method": method,
+            "model_ready": False,
+            "lookback_hours_used": lookback_hours_used,
+            "coverage_ratio": coverage_ratio,
+            "source_observations": len(rows),
+            "generated_at": datetime.utcnow().isoformat(),
+        }
 
     mae = validation.get("MAE")
     confidence_proxy = round(max(0.0, min(0.99, 1 - float(mae) / 100)) if mae is not None else 0.5, 2)
@@ -352,14 +525,16 @@ def forecast_server(db, server_id: str, horizon_minutes: int = FORECAST_HORIZON_
         "delta_cpu_pp": round(float(predicted_cpu) - float(current.cpu_utilization), 2),
         "trend": trend,
         "method": method,
-        "model_version": model_version,
+        "model_version": method_version,
         "confidence_proxy": confidence_proxy,
         "validation_mae": validation.get("MAE"),
         "validation_rmse": validation.get("RMSE"),
         "validation_r2": validation.get("R2"),
+        "lookback_hours_used": lookback_hours_used,
+        "coverage_ratio": coverage_ratio,
         "source_observations": len(rows),
         "generated_at": datetime.utcnow().isoformat(),
-        "model_ready": model is not None and live_features is not None and horizon_minutes == FORECAST_HORIZON_MINUTES,
+        "model_ready": model_ready,
     }
 
 

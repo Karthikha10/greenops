@@ -76,7 +76,8 @@ def candidate_models() -> dict:
 
 
 def _train_one_target(frame: pd.DataFrame, target_column: str, target_label: str,
-                       model_path: str, metrics_path: str, source_rows: int) -> dict:
+                       model_path: str, metrics_path: str, source_rows: int,
+                       horizon_minutes: int = forecasting.FORECAST_HORIZON_MINUTES) -> dict:
     X = frame[forecasting.FEATURE_COLUMNS]
     y = frame[target_column]
 
@@ -110,8 +111,8 @@ def _train_one_target(frame: pd.DataFrame, target_column: str, target_label: str
         "selected_metrics": results[winner],
         "all_results": results,
         "feature_columns": forecasting.FEATURE_COLUMNS,
-        "target": f"{target_label} at 15 minutes in the future",
-        "horizon_minutes": forecasting.FORECAST_HORIZON_MINUTES,
+        "target": f"{target_label} at {horizon_minutes} minutes in the future",
+        "horizon_minutes": horizon_minutes,
         "source_rows": source_rows,
         "training_samples": len(frame),
         "train_samples": len(X_train),
@@ -140,10 +141,14 @@ def train_from_database(db: Session) -> dict:
 
     frame = pd.DataFrame(samples).sort_values("timestamp")
 
-    # CPU forecast -- feeds Server Detail's "will this idle server stay idle" check.
+    # CPU forecast -- feeds Server Detail's "will this idle server stay idle" check
+    # AND recommendations.py's consolidation safety check (forecast_candidate_server()).
+    # Horizon stays 15 minutes -- never change this without also checking every
+    # caller of forecast_candidate_server(), which relies on this exact horizon.
     cpu_metadata = _train_one_target(
         frame, "target_cpu", "cpu_utilization",
         forecasting.MODEL_PATH, forecasting.METRICS_PATH, len(rows),
+        horizon_minutes=forecasting.FORECAST_HORIZON_MINUTES,
     )
 
     # Memory forecast -- same features and training data, different target.
@@ -155,9 +160,27 @@ def train_from_database(db: Session) -> dict:
         memory_metadata = _train_one_target(
             memory_frame, "target_memory", "memory_utilization",
             forecasting.MEMORY_MODEL_PATH, forecasting.MEMORY_METRICS_PATH, len(rows),
+            horizon_minutes=forecasting.FORECAST_HORIZON_MINUTES,
         )
 
-    return {"cpu_model": cpu_metadata, "memory_model": memory_metadata}
+    # Separate 1-hour-ahead CPU model for Server Detail's operator-facing
+    # "1h" tier -- same lagged-feature architecture, just retargeted further
+    # out, and saved under its own filename so it never touches the 15-minute
+    # model the safety check depends on. Built from its own sample set since
+    # build_feature_rows() shifts the target by horizon_minutes.
+    long_samples = forecasting.build_feature_rows(
+        rows, horizon_minutes=forecasting.LONG_FORECAST_HORIZON_MINUTES
+    )
+    long_metadata = None
+    if len(long_samples) >= MIN_SAMPLES:
+        long_frame = pd.DataFrame(long_samples).sort_values("timestamp")
+        long_metadata = _train_one_target(
+            long_frame, "target_cpu", "cpu_utilization",
+            forecasting.LONG_MODEL_PATH, forecasting.LONG_METRICS_PATH, len(rows),
+            horizon_minutes=forecasting.LONG_FORECAST_HORIZON_MINUTES,
+        )
+
+    return {"cpu_model": cpu_metadata, "memory_model": memory_metadata, "long_cpu_model": long_metadata}
 
 
 def main():
@@ -174,6 +197,15 @@ def main():
             print(
                 "Memory model skipped -- not enough samples with a valid "
                 "future memory reading yet."
+            )
+        if metadata["long_cpu_model"] is not None:
+            print(f"Saved {forecasting.LONG_MODEL_PATH}")
+            print(f"Saved {forecasting.LONG_METRICS_PATH}")
+        else:
+            print(
+                "1-hour CPU model skipped -- not enough samples with a valid "
+                "60-minute-future reading yet; the 1h tier will use trend "
+                "extrapolation until there's enough history."
             )
     finally:
         db.close()

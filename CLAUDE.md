@@ -48,14 +48,14 @@ below. **Explicitly not built: criticality/SLA gating** — the roadmap's item
 read as gating a consolidation recommendation on whether a server is
 critical — it isn't, on purpose, until that's built.
 
-**Also explicitly narrower than it sounds: "safe" only ever means CPU and
-memory.** The consolidation safety check (`SAFETY_LIMIT_PERCENT` in
-`recommendations.py`) never evaluates network throughput, cooling/thermal
-headroom, target storage capacity, or electrical/power capacity — see
-"Phase 2" below, `recommendations.py`, for exactly which of those feed the
-power *estimate* without ever gating the *decision*. Don't describe a
-recommendation as having "considered everything" about the target — it
-hasn't, by design so far, not by oversight of this specific fact.
+**"Safe" now means CPU, memory, network, and thermal — still not everything.**
+The consolidation safety check (`SAFETY_LIMIT_PERCENT`/`NETWORK_SAFETY_LIMIT_GBPS`/
+`THERMAL_SAFETY_LIMIT_C` in `recommendations.py`) widened this session to
+also gate on post-move network throughput and predicted post-move inlet
+temperature — see "Phase 2" below for exactly how. It still never evaluates
+target storage capacity or electrical/power capacity. Don't describe a
+recommendation as having "considered everything" about the target — closer
+than before, but still not everything, by design, not oversight.
 
 ---
 
@@ -271,15 +271,73 @@ it — otherwise keep the simpler model. On this dataset Linear Regression wins
 both targets; neither RF nor XGBoost cleared the bar.
 
 **Inference** (`/servers/{id}/prediction` in `main.py`): builds a one-row
-DataFrame from the server's latest live telemetry; `time_of_day` is currently
-hardcoded to `"Peak"` (known simplification, not wired to real time yet).
+DataFrame from the server's latest live telemetry; `time_of_day` is derived
+from the reading's real timestamp via `rules_engine.get_time_of_day()` (no
+longer hardcoded — see "Bugs found and fixed," entry 25).
 **Expect live prediction errors to run higher than the reported MAE** — the
 model trains on real historical relationships, but live data comes from
 simulators using their own simplified generation formulas (e.g.
-`server_monitor.py`'s `cpu = workload_intensity × 100 + noise`). This is a
-genuine train/inference distribution shift, not a bug — the Server Detail
-page shows measured-vs-predicted side by side specifically so this gap stays
-visible instead of hidden.
+`server_monitor.py`'s `cpu = workload_intensity × 100 + noise`, where
+`memory_utilization`/`network_throughput_gbps` are themselves just noisy
+functions of that same `cpu`, not independent signals). This is a genuine
+train/inference distribution shift, not a bug.
+
+**The CPU model's current role and its actual live footprint — read this
+before assuming it's "doing" anything right now.** `/servers/{id}/prediction`
+exists, works, and is exactly as described above, but **nothing in the
+frontend currently calls it** — `ServerDetail.jsx`'s own measured-vs-predicted
+numbers come from the separate *forecast* model in `forecasting.py`, not
+this one. The CPU model's only actual visible footprint today is the static
+MAE/RMSE/R² table on `ModelEval.jsx` (`GET /model-evaluation`, which just
+reads `ml_artifacts/metrics.json`, written once at training time — no live
+`.predict()` call happens anywhere in the running app right now). Its real
+role today is a **completed offline validation result** — proof, on real
+data, that the feature set explains CPU behavior — not a live "sanity
+check" despite how that phrase gets used casually; nothing is currently
+comparing anything on screen.
+
+**Its intended future role — deliberately not built yet, the same way
+criticality/SLA gating is deliberately not built (see "Status" above) —
+is a live hardware/environment health check**, not a forecast: compare the
+model's snapshot prediction (what CPU *should* be, given current workload/
+memory/network/cooling/PUE) against what's *actually* measured, on an
+ongoing basis, to catch a server behaving inconsistently with its own
+conditions — a failing fan, a misbehaving process, degraded cooling —
+the same way an unexpected drop in a car's fuel efficiency at a given
+speed/load signals a mechanical problem before anything else would.
+**Two other CPU-model roles were seriously considered this session and
+explicitly rejected — worth remembering why, so they don't get
+re-proposed:**
+- *A cold-start forecast fallback* (use this model's snapshot when there's
+  not enough history for the real forecast) — rejected because it risks
+  masking a genuine telemetry outage behind a plausible-looking number,
+  the exact anti-pattern "Bugs found and fixed" entry 22 already fixed
+  once in `/servers`' status logic. A snapshot estimate is not a forecast
+  either, no matter how it's labeled — it still just assumes "future =
+  present."
+- *A third consolidation safety check, gating on feature-combination risk*
+  ("this server type + this cooling type behaves less predictably under
+  this memory load") — rejected because `train_model.py`'s pipeline feeds
+  straight into a plain `LinearRegression()` with no interaction terms; an
+  additive linear model is architecturally incapable of representing an
+  interaction effect between features, so no amount of clean data would
+  make this claim true for the model this project actually has.
+
+**The health-check role isn't ready to build either, and not only because
+of the categorical-mismatch fix (done, see entry 24) or the cooling/PUE
+realism fix (done, see entry 26).** Even with both of those, this
+simulator's causality only runs *load → environment*
+(`cooling_monitor.py` reads CPU to generate temperature/efficiency), never
+*environment → load* — `server_monitor.py` still generates measured CPU
+purely from `workload_intensity`, with zero dependency on cooling. A real
+cooling failure (the exact scenario this health check exists to catch)
+has no code path to ever happen in this simulator, fixed or not — predicted
+and measured would just agree by construction. Building this for real
+would need a third piece of work: a deliberate fault-injection mode (e.g.
+an occasional "stuck/degraded cooling" event, decoupled from load, lasting
+a few minutes) so there's ever something real for the health check to
+catch. Don't build the health check without that, or it will never fire on
+anything and nobody will trust it.
 
 ---
 
@@ -379,17 +437,46 @@ built; the narrow definition of "safe" (CPU/memory only) below is another,
 named the moment it was noticed rather than something built-in from the
 start.**
 
-**`forecasting.py` / `train_workload_forecast.py`** — near-term (15/30/60min)
-CPU forecast, gated to only run for servers currently idle/underutilized by
-the same 6h rule the flags use. Trains a lagged-feature model (5/10/15/20min
-CPU lags + hour-of-day) from real timestamped telemetry once ≥30 samples
-exist; falls back to transparent trend extrapolation until then, and says so
+**`forecasting.py` / `train_workload_forecast.py`** — near-term CPU forecast,
+gated to only run for servers currently idle/underutilized by the same 6h
+rule the flags use. Trains a lagged-feature model (5/10/15/20min CPU lags +
+hour-of-day) from real timestamped telemetry once ≥30 samples exist; falls
+back to transparent trend extrapolation until then, and says so
 (`"model_ready": false`) rather than pretending. Endpoint:
-`GET /servers/{id}/forecast`. **Only `horizon_minutes=15` actually uses the
-trained model** — 30/60 (both offered in the Server Detail dropdown) always
-fall back to `trend_forecast()` extrapolation, silently. Not a bug, just a
-real limitation worth knowing about: `FORECAST_HORIZON_MINUTES = 15` is the
-only horizon the model was trained for.
+`GET /servers/{id}/forecast`.
+
+**Operator-facing horizons are 1h / 6h / 24h** (`forecasting.OPERATOR_HORIZONS`
+= `(60, 360, 1440)` minutes), reworked from the original 15/30/60min menu
+because a 15-minute-ahead check wasn't the useful question for an operator
+deciding whether a server will stay idle. Each tier is handled honestly,
+not forced through one method:
+- **1h** (`LONG_FORECAST_HORIZON_MINUTES = 60`) — its own trained
+  lagged-feature model (`workload_forecast_1h_model.joblib` /
+  `forecast_1h_metrics.json`), same architecture as the internal 15-minute
+  one below, just retargeted 60 minutes out. Falls back to
+  `trend_forecast()` until enough 60-min-ahead samples exist.
+- **6h / 24h** (`MEDIUM_HORIZON_MINUTES = 360`, `FAR_HORIZON_MINUTES =
+  1440`) — **no trained model, deliberately.** Not enough real live
+  history exists yet for a lagged model at this range, and even with more
+  history, each server's workload here is generated from a fixed
+  per-server `bias` (see `server_monitor.py`) that doesn't drift or cycle
+  over time — the honest estimate for a near-stationary series that far
+  out is reversion to its own recent average, not a lagged regression or a
+  straight-line extrapolation of the last few minutes (which would
+  overshoot badly at this range). See `long_horizon_forecast()`: averages
+  `field` over whatever real telemetry falls inside the requested window,
+  and **refuses to answer** (`predicted_cpu: null`, an honest "not enough
+  history yet" message, not a guess) unless real coverage reaches at least
+  half the requested window with ≥10 samples.
+
+**`FORECAST_HORIZON_MINUTES = 15` still exists, unchanged, and must never be
+repointed at a different horizon.** It's the internal horizon
+`recommendations.py`'s consolidation safety check is built and tested
+against — `forecast_candidate_server()` is always called with no explicit
+horizon argument, so it always resolves to this constant and its own model
+file (`workload_forecast_model.joblib`). The 1h/6h/24h tiers above are a
+completely separate code path (`forecast_server()`, the Server Detail
+dropdown) that never touches this one.
 
 **Target-candidate forecasting** (`forecasting.forecast_candidate_server()`)
 — a second, separate forecasting path with the mirror-image eligibility
@@ -502,57 +589,81 @@ Used by `_rank_consolidation_candidates()` below — not used anywhere else.
    or it would silently corrupt it by mixing two different data-generating
    regimes. Check `power_monitor.py`'s git history / a timestamp cutoff
    before trusting any bulk export of `power_telemetry` for that purpose.
-5. **"Safe" means CPU and memory only — nothing else is a gate, even
-   though other metrics are collected.** Precisely, by dimension:
-   - **CPU / memory** — the only two dimensions actually compared against
-     `SAFETY_LIMIT_PERCENT` (75%), both for the current-snapshot check
-     (`safe_now`) and the forecast check (`safe_forecast`, point 2 above).
-   - **Network throughput** — fed into the power model as an *input
-     feature* (the post-move value: target's current + source's current ×
-     0.9, same overhead factor as CPU/memory), so it shapes the predicted
-     kW/₹ number. **No threshold exists for it anywhere** — there's no
-     network equivalent of the 75% limit, so a move that would saturate a
-     target's network is not rejected, or even flagged, on that basis.
-   - **Cooling efficiency / inlet temperature** — same treatment as
-     network: input features to the power model's prediction, never
-     compared against a thermal capacity limit. A target with poor cooling
-     doesn't get penalized in the safety decision, only in the power
-     number that comes out the other side.
-   - **Target's storage capacity** — not evaluated at all for a
+5. **"Safe" means CPU, memory, network, and thermal — widened this
+   session, still not everything.** Precisely, by dimension:
+   - **CPU / memory** — compared against `SAFETY_LIMIT_PERCENT` (75%), both
+     for the current-snapshot check (`safe_now`) and the forecast check
+     (`safe_forecast`, point 2 above).
+   - **Network throughput** — now a real gate, not just a power-model input
+     feature. `post_move_network` (target's current + source's current ×
+     0.9, same overhead factor as CPU/memory) is compared against
+     `NETWORK_SAFETY_LIMIT_GBPS` (18.75 Gbps = 75% of an assumed 25 Gbps
+     NIC — `NETWORK_CAPACITY_GBPS`, a stated real-world convention, not
+     derived from this project's data, since the simulator has no notion
+     of network "capacity" to measure a percentage against). Exposed per
+     candidate as `network_ok`; folds into `safe_now`.
+   - **Cooling / thermal** — also now a real gate. Not a raw sum of two
+     servers' temperatures (physically meaningless) — `predicted_post_move_temp_c`
+     applies `cooling_monitor.py`'s own load→temperature formula
+     (`THERMAL_BASE_TEMPERATURE_C` + per-cooling-type rise × `post_move_cpu`
+     fraction) to estimate what the target's *own* temperature would become
+     after taking on the extra workload, then compares that against
+     `THERMAL_SAFETY_LIMIT_C` (30°C, inspired by ASHRAE's allowable inlet
+     range, not derived from this project's data). **These constants are
+     duplicated from `simulators/cooling_monitor.py` and must be kept in
+     sync by hand** — the simulators and backend are separate deployables
+     with no shared package, the same reason `WUE_FACTORS` is already
+     independently duplicated three times across this codebase. Exposed
+     per candidate as `thermal_ok`; folds into `safe_now`.
+   - **Neither network nor thermal has a forecast counterpart** — only CPU
+     and memory have trained forecast models (`forecast_candidate_server()`).
+     A network/thermal-blocked candidate is always a current-snapshot
+     rejection, never a "risky soon" one.
+   - **`cpu_memory_ok_now` is exposed separately from the combined
+     `safe_now`**, specifically so `RecommendationDetail.jsx`'s candidate
+     list can keep showing a candidate that's only rejected on network/
+     thermal grounds (same as it already does for "Risky soon") instead of
+     silently hiding it the way a genuinely CPU/memory-over-limit-now
+     candidate is hidden. Filtering the candidate list on the combined
+     `safe_now` instead of `cpu_memory_ok_now` was a real bug introduced
+     and caught within this same session, before ever shipping — worth
+     remembering if this ever needs touching again: the two booleans exist
+     for different purposes (`safe_now` = the actual safety decision,
+     `cpu_memory_ok_now` = the visibility filter), don't collapse them
+     back into one.
+   - **Target's storage capacity** — still not evaluated for a
      consolidation. This action only ever moves compute workload
      (CPU/memory); storage actions (archive/dedupe/rightsize) are a
      completely separate code path that never intersects with
      consolidation safety.
-   - **Electrical/power capacity** — no modeled ceiling on how much power
-     a rack or PDU can actually supply. The system will predict an
-     arbitrarily high post-move kW draw with nothing stopping it.
+   - **Electrical/power capacity** — still no modeled ceiling on how much
+     power a rack or PDU can actually supply.
    - **Criticality/SLA** — the pre-existing, already-documented gap above;
      listed here again only so this becomes one place that names every
      current boundary of "safe" together, rather than scattering them.
 
    **Don't describe a recommendation as having "considered everything"
-   about the target.** It considers CPU and memory, now and by forecast —
-   real and genuinely useful, but a narrower claim than "safe" can sound
-   like standing alone. If asked to widen this (network/thermal/power
-   capacity thresholds, or storage-aware consolidation), treat it as new
-   scoped work, the same way target-forecasting was — not a quick tweak to
-   the existing threshold check.
+   about the target.** Closer than before — CPU, memory, network, and
+   thermal all real gates now — but storage and power capacity still
+   aren't. If asked to widen those two, treat it as new scoped work, the
+   same way this session's network/thermal work was — not a quick tweak.
 
-**Recommendations UI is list → detail, not one long page of expanded
-cards.** `/recommendations` is a compact table (server, action, priority,
-target/status, score) — click a row to go to `/recommendations/:id`, which
-fetches `GET /recommendations/{id}` (recommendation metadata + full
-`impact`, including `candidates`) and shows the full explanation, the ranked
-candidate table, the impact numbers, and the accept/snooze/dismiss buttons.
-Don't put the full detail back inline in the list rows — that was tried and
-was "atmost blank and can't comprehend properly" per direct feedback; the
-list's job is triage, the detail page's job is the decision. One exception,
-added deliberately: the list table's **"Target forecast (CPU)" column**
-shows the winning candidate's own current→predicted CPU (pulled from
-`impact.candidates`, matched by `target_server_id`, via the
-`targetForecast()` helper in `Recommendations.jsx`) with a rising/falling
-arrow — this is a single scannable number, not the full explanation, so it
-doesn't violate the "triage only" rule the way inline cards did.
+**Recommendations UI is list → detail** — see "Recommendations page
+history" above for the current card-based state (state 3). `/recommendations`
+shows `RecCard`s with inline Accept/Snooze/Dismiss; each still links to
+`/recommendations/:id`, which fetches `GET /recommendations/{id}`
+(recommendation metadata + full `impact`, including `candidates`) for the
+ranked candidate table, full assumptions list, and decision buttons no card
+view has ever tried to inline. **The "Target forecast (CPU)" badge**
+(dropped when the list was swapped to cards, restored afterward) shows the
+winning candidate's own current→predicted CPU on each `consolidate` card —
+pulled from `impact.candidates`, matched by `server_id === impact.
+target_server_id`, via the `targetForecast()` helper in
+`Recommendations.jsx` — with a ▲/▼/▬ arrow next to the badge. Renders
+nothing when there's no safe target (the `S12`-style "no safe target right
+now" case) since there's no candidate to show a forecast for. Still a single
+scannable number, not the full explanation, so it doesn't reintroduce
+state 1's problem (dense cards with no visual hierarchy).
 
 **Ranking** (`rank_recommendations()`) — pending recommendations are scored
 as `Σ(weight × normalized_impact) − risk_weight × risk`, normalized against
@@ -839,6 +950,164 @@ re-verified live:**
     Underutilized, etc.), check `avg_cpu` directly in the API response
     before trusting the `state` label — a `None` there means "no recent
     data," not "confirmed fine."
+23. **Role-based access control (`auth.py`, `User` model, JWT login, per-role
+    route guards) landed via a teammate's commit — real, working feature,
+    end-to-end tested after the fix below.** Three roles:
+    `infrastructure_manager` (full access, incl. user management and
+    accept/snooze/dismiss decisions), `sustainability_manager` (read-only —
+    dashboards, ESG report), `operations_engineer` (can mark approved
+    actions executed via `PATCH /operator-actions/{id}`, cannot make the
+    original accept/snooze/dismiss decision). Enforced both server-side
+    (`require_role()` dependency in `main.py`) and client-side (`Login.jsx`,
+    `AuthContext.jsx`, role-conditional nav in `Layout.jsx`,
+    `UserManagement.jsx` for infra managers to create/edit/deactivate
+    users). Seed users via `python -m app.seed_users` (`backend/seed_users.py`).
+    **Same bug class as #21, third occurrence**: the commit added three new
+    `OperatorAction` columns (`decided_by_user_id`, `decided_by_name`,
+    `decided_by_role` — an audit trail of who made each decision) but, same
+    as always, `Base.metadata.create_all()` only creates new tables (that's
+    why the new `users` table appeared fine) and never alters existing
+    ones. `operator_actions` was missing all three columns, so every ORM
+    query touching `OperatorAction` — `/reports/esg`, `GET
+    /operator-actions`, `POST /recommendations/{id}/action` — 500'd on
+    "column does not exist," which is what broke the ESG page. **Not**
+    related to the teammate developing on macOS — this is a Postgres schema
+    gap, identical on any OS. Fixed with the same kind of manual migration
+    as #21:
+    ```sql
+    ALTER TABLE operator_actions
+    ADD COLUMN IF NOT EXISTS decided_by_user_id INTEGER REFERENCES users(id),
+    ADD COLUMN IF NOT EXISTS decided_by_name VARCHAR,
+    ADD COLUMN IF NOT EXISTS decided_by_role VARCHAR;
+    ```
+    **This is now the third time this exact mistake has happened.** Any
+    commit — from either collaborator — that adds a column to an existing
+    SQLAlchemy model needs a manual `ALTER TABLE` (or a real migration tool)
+    run against the live Postgres DB alongside the code change; `create_all()`
+    silently does nothing for it, and the app will look fine everywhere that
+    doesn't touch the new column until something does. Worth actually
+    adopting Alembic if a fourth occurrence happens.
+24. **Categorical mismatch between the live simulators and the ML training
+    vocabulary** — `simulators/server_monitor.py` and `cooling_monitor.py`
+    used `cooling_type` values `Air`/`Evaporative`/`Liquid` and
+    `datacenter_region` values `APAC`/`EMEA`/`NA`. `green_ai_datacenter.csv`
+    (the real dataset both validation models train on) only has
+    `Air`/`Hybrid`/`Liquid` and `APAC`/`EU`/`ME` — "Evaporative", "EMEA",
+    and "NA" don't exist in it at all, so `OneHotEncoder(handle_unknown=
+    "ignore")` was silently zero-encoding those values for every server
+    using them, quietly degrading the CPU and power validation models' live
+    predictions for those servers with no visible warning anywhere. Fixed
+    by renaming to the real training categories (`Evaporative`→`Hybrid`,
+    `EMEA`→`EU`, `NA`→`ME` — arbitrary substitutions where the two
+    vocabularies don't have a natural real-world equivalent, e.g. the
+    dataset simply has no North America category; the point was only that
+    every value is now one the trained models actually recognize) across
+    both simulators, `rules_engine.WUE_FACTORS`, and the two frontend
+    `WUE_FACTORS` copies. Required a direct Postgres update of the 13
+    already-registered `Server` rows too — `POST /servers/register` is
+    register-once (returns `"already_registered"` and does nothing for an
+    existing `server_id`), so renaming the simulators' own source dicts
+    alone would never have touched servers already sitting in the DB.
+25. **`time_of_day` was hardcoded to `"Peak"` for every CPU/power model
+    inference**, regardless of the actual time — a known simplification
+    from early in the project, never revisited. Fixed with
+    `rules_engine.get_time_of_day()`, a stated convention (not derived from
+    data, same spirit as the idle-threshold clamp): Night 00:00-06:00, Peak
+    09:00-21:00, Off-Peak the two shoulder windows — wired into both
+    `main.py`'s `/servers/{id}/prediction` and `recommendations.py`'s
+    power-model feature builder, using each reading's own real timestamp
+    rather than server clock time.
+26. **PUE had zero relationship to anything, even after the power fix**
+    — `power_monitor.py`'s `overhead_ratio` (which determines
+    `facility_power_kw ÷ it_power_kw`, i.e. PUE) was still a pure
+    `random.uniform(1.15, 1.55)`, independent of load or cooling, even
+    after `it_power_kw` itself was fixed to respond to CPU/memory (see
+    entry 17 above). This meant `pue` — one of the CPU model's six numeric
+    inputs — stayed exactly as uninformative as it was before that fix, a
+    gap named but not closed at the time. Fixed together with a second,
+    related gap: `cooling_monitor.py`'s `inlet_temperature_c` and
+    `cooling_efficiency` were still pure random draws with no relationship
+    to load either, so two of the CPU model's six numeric inputs were
+    noise regardless of the earlier fixes. Both fixed the same way as
+    entry 17 — read live state via `GET /servers` before generating a
+    reading, rather than drawing independently:
+    - `cooling_monitor.py` now computes `inlet_temperature_c` and
+      `cooling_efficiency` as a function of that server's current CPU
+      (fetched live), with a **different response curve per
+      `cooling_type`** — Air shows the largest temperature rise and
+      efficiency drop under load, Liquid the smallest, Hybrid in between.
+      A single flat response for every cooling type was deliberately
+      avoided as a worse simplification than the noise it replaced.
+    - `power_monitor.py`'s `overhead_ratio` now derives from that same
+      server's current `cooling_efficiency` (also fetched live, via a new
+      `cooling_efficiency` field added to `GET /servers`'s response
+      specifically so `power_monitor.py` could read it in the one bulk
+      request it already makes, without an extra per-server call) — worse
+      cooling efficiency now means worse (higher) overhead, i.e. worse
+      PUE, instead of a random draw.
+    Verified directly (bypassing live noise/timing by calling
+    `power_monitor.generate_reading()` with fixed inputs): efficiency 0.99
+    → PUE 1.17, efficiency 0.40 → PUE 1.52, a clean monotonic gradient.
+    **At the time this fix landed, it did not change any decision logic**
+    — the consolidation safety check still only gated on CPU/memory (see
+    "Phase 2" above); this only changed what `inlet_temperature_c`/
+    `cooling_efficiency`/`pue` meant when fed into the CPU/power validation
+    models or displayed on Server Detail. (That gap was closed in the very
+    next piece of work this same session — see entry 27 below, the
+    thermal safety check reuses this fix's own load→temperature formula.)
+    **Does not change WUE/water numbers** — `total_water_l`/`wue_l_per_kwh`
+    are computed from `cooling_type` (categorical, static) via
+    `WUE_FACTORS`, never from the numeric `cooling_efficiency` field, so
+    this fix doesn't touch water math at all, despite surface-level
+    intuition that it might.
+27. **Widened consolidation safety to gate on network and thermal, adopted
+    Alembic, and along the way found two real bugs before they shipped.**
+    Network throughput and predicted post-move inlet temperature became
+    real gates (`network_ok`/`thermal_ok`, folded into `safe_now`) — see
+    "Phase 2" → point 5 above for the exact formulas and the stated
+    conventions behind both thresholds (25 Gbps NIC / 30°C, neither
+    derived from this project's own data, same spirit as the idle
+    threshold). Two bugs caught in the same pass, before either ever
+    shipped to a real user:
+    1. **The candidate-visibility filter would have silently hidden every
+       network/thermal-rejected candidate.** `RecommendationDetail.jsx`'s
+       `safeCandidates` filter checked the combined `safe_now`, which now
+       also depends on network/thermal — so a candidate rejected only on
+       network grounds would vanish from the list entirely, the opposite
+       of the transparency this page exists for. Fixed by exposing a
+       separate `cpu_memory_ok_now` specifically for that filter, keeping
+       the combined `safe_now` for the actual safety decision. Verified
+       live: S5→S11 (rejected on network — 19.5 Gbps against an 18.75
+       limit) now correctly shows up with a "Network limit" badge and the
+       actual numbers, instead of disappearing.
+    2. **A pre-existing Rules-of-Hooks violation in `RecommendationDetail.jsx`**,
+       unrelated to anything built this session but found while verifying
+       the above: `const { user } = useAuth()` was called at line ~684,
+       *after* two conditional early returns (`if (loading) return`,
+       `if (!rec) return`) — so the component called a different number of
+       hooks depending on render state, a real correctness bug (not just a
+       lint warning) that could cause stale/wrong `user` values. Fixed by
+       moving the `useAuth()` call to the top of the component alongside
+       the other hooks, before any early return.
+    Also adopted **Alembic** (`backend/alembic/`) — see "How to run it"
+    above for the new schema-change workflow. Onboarded onto the *existing*
+    Postgres schema via an empty baseline revision + `alembic stamp head`
+    (not a real `upgrade`, since every table already existed) — verified
+    with `alembic check` reporting "No new upgrade operations detected"
+    immediately after, confirming every manual `ALTER TABLE` this session
+    had already left the live schema exactly matching `models.py`. Also
+    removed two genuinely dead/unnecessary columns found via a full audit
+    of every table while addressing this: `Forecast.predicted_power_kw`
+    (hardcoded to `None` on every write, never read anywhere) and
+    `Recommendation.title` (real data, but 100% derivable from
+    `recommendation_type` via a static lookup, and never read by the
+    frontend, which has its own independent label map). Two other fields
+    were checked and deliberately left alone since they're real,
+    correctly-populated data just not yet surfaced in any UI, a different
+    category from "dead": `OperatorAction.notes` (wired end-to-end, always
+    empty today since no page has a text input for it) and
+    `Preferences.updated_at` (returned by `GET /preferences`, just not
+    displayed).
 
 If something looks numerically "off" again, check for the same class of
 issue: an assumption about cadence/scale that isn't actually enforced
@@ -860,6 +1129,7 @@ python -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\act
 pip install -r requirements.txt
 python -m app.compute_thresholds     # one-time: derive per-type thresholds from the dataset
 python -m app.train_model            # one-time: train CPU + power models (~15s)
+alembic upgrade head                 # apply any pending schema migrations (see below)
 uvicorn app.main:app --reload        # API at http://localhost:8000
 
 # Simulators (each in its own terminal — all 4 needed for live-updating data)
@@ -876,7 +1146,23 @@ npm run dev                          # UI at http://localhost:5173
 ```
 
 `DATABASE_URL` env var swaps SQLite for Postgres — zero code change,
-`database.py` reads it automatically.
+`database.py` reads it automatically. Alembic (`backend/alembic/`) reads
+the same env var via `alembic/env.py` — no separate DB config to maintain.
+
+**Schema changes now go through Alembic, not manual `ALTER TABLE`.** After
+editing `models.py`, run (from `backend/`, with `DATABASE_URL` set the same
+way any other command in this project needs it):
+```bash
+alembic revision --autogenerate -m "describe the change"
+alembic upgrade head
+```
+Then commit the generated file under `alembic/versions/`. This exists
+specifically because `Base.metadata.create_all()` only ever creates *new*
+tables and silently does nothing for a column added to an existing one —
+see "Bugs found and fixed" entries 21 and 23 for two real production
+breakages caused by exactly that gap before Alembic was adopted. Check
+`alembic current` / `alembic check` against the live DB if anything about
+the schema ever looks inconsistent with what the models say.
 
 ---
 

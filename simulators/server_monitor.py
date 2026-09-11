@@ -121,6 +121,17 @@ def generate_reading(server_id, bias):
 
 def register_servers():
 
+    # cooling_type and datacenter_region values are deliberately restricted
+    # to green_ai_datacenter.csv's actual training vocabulary --
+    # cooling_type: Air/Hybrid/Liquid, datacenter_region: APAC/EU/ME. The
+    # dataset has no "Evaporative"/"EMEA"/"NA" categories at all, so those
+    # values (used here previously) were silently zero-encoded by
+    # OneHotEncoder(handle_unknown="ignore") for every server carrying them
+    # -- degrading the CPU/power validation models' live predictions with no
+    # visible warning anywhere. EMEA maps to EU and NA maps to ME below;
+    # neither is a precise real-world equivalent (the dataset simply has no
+    # North America category), the goal is only that every value here is one
+    # the trained models actually recognize instead of quietly discarding.
     meta = {
         "S1": {
             "server_type": "Compute",
@@ -136,14 +147,14 @@ def register_servers():
 
         "S3": {
             "server_type": "GPU",
-            "cooling_type": "Evaporative",
-            "datacenter_region": "EMEA",
+            "cooling_type": "Hybrid",
+            "datacenter_region": "EU",
         },
 
         "S4": {
             "server_type": "Storage",
             "cooling_type": "Liquid",
-            "datacenter_region": "NA",
+            "datacenter_region": "ME",
         },
 
         "S5": {
@@ -166,20 +177,20 @@ def register_servers():
         # -------------------------------------------------------
         "S7": {
             "server_type": "GPU",
-            "cooling_type": "Evaporative",
-            "datacenter_region": "EMEA",
+            "cooling_type": "Hybrid",
+            "datacenter_region": "EU",
         },
 
         "S8": {
             "server_type": "GPU",
-            "cooling_type": "Evaporative",
-            "datacenter_region": "NA",
+            "cooling_type": "Hybrid",
+            "datacenter_region": "ME",
         },
 
         "S9": {
             "server_type": "Storage",
             "cooling_type": "Liquid",
-            "datacenter_region": "NA",
+            "datacenter_region": "ME",
         },
 
         "S10": {
@@ -197,13 +208,13 @@ def register_servers():
         "S12": {
             "server_type": "Edge",
             "cooling_type": "Air",
-            "datacenter_region": "EMEA",
+            "datacenter_region": "EU",
         },
 
         "S13": {
             "server_type": "Compute",
             "cooling_type": "Air",
-            "datacenter_region": "NA",
+            "datacenter_region": "ME",
         },
     }
 

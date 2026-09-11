@@ -195,12 +195,36 @@ def compute_pue(it_power_kw: float, facility_power_kw: float) -> float:
     return round(facility_power_kw / it_power_kw, 3)
 
 
+def get_time_of_day(timestamp: datetime = None) -> str:
+    """
+    Maps a real clock hour onto the three time_of_day categories the CPU/
+    power validation models were actually trained on (green_ai_datacenter.csv
+    has only Night/Off-Peak/Peak -- no fourth bucket). A stated convention,
+    not derived from data, same spirit as the idle-threshold clamp: Night
+    00:00-06:00, Peak 09:00-21:00 (typical high-demand hours), Off-Peak for
+    the two shoulder windows in between. Replaces the previous hardcoded
+    "Peak" that was used for every inference regardless of actual time.
+    """
+    hour = (timestamp or datetime.utcnow()).hour
+    if hour < 6:
+        return "Night"
+    if hour < 9:
+        return "Off-Peak"
+    if hour < 21:
+        return "Peak"
+    return "Off-Peak"
+
+
 # Assumed WUE factors (L/kWh) by cooling type -- clearly labeled as an
 # industry-average estimate, since real facility water meters aren't
 # available for this prototype. See project notes for justification.
+#
+# Keys match the simulators' cooling_type vocabulary, which was deliberately
+# restricted to green_ai_datacenter.csv's own categories (Air/Hybrid/Liquid)
+# -- "Hybrid", not "Evaporative", is the real training-data category.
 WUE_FACTORS = {
     "Air": 0.3,
-    "Evaporative": 1.8,
+    "Hybrid": 1.8,
     "Liquid": 0.9,
 }
 
@@ -266,7 +290,7 @@ def compute_wue_liters_weighted(energy_by_server: dict, cooling_type_by_server: 
     Water total weighted by each server's own cooling type and its own share
     of energy use, instead of applying one cooling type's WUE factor to the
     whole facility's energy. Servers on different cooling systems (Air vs.
-    Evaporative vs. Liquid) have WUE factors up to 6x apart, so picking a
+    Hybrid vs. Liquid) have WUE factors up to 6x apart, so picking a
     single "representative" cooling type can swing the facility-wide number
     wildly depending on which one happens to be picked.
 

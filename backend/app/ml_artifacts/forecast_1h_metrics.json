@@ -2,25 +2,25 @@
   "model_version": "workload-forecast-v1",
   "selected_model": "LinearRegression",
   "selected_metrics": {
-    "MAE": 6.585,
-    "RMSE": 8.185,
-    "R2": 0.851
+    "MAE": 6.514,
+    "RMSE": 8.09,
+    "R2": 0.886
   },
   "all_results": {
     "LinearRegression": {
-      "MAE": 6.585,
-      "RMSE": 8.185,
-      "R2": 0.851
+      "MAE": 6.514,
+      "RMSE": 8.09,
+      "R2": 0.886
     },
     "RandomForest": {
-      "MAE": 6.665,
-      "RMSE": 8.268,
-      "R2": 0.848
+      "MAE": 6.703,
+      "RMSE": 8.392,
+      "R2": 0.877
     },
     "XGBoost": {
-      "MAE": 6.588,
-      "RMSE": 8.148,
-      "R2": 0.852
+      "MAE": 6.567,
+      "RMSE": 8.178,
+      "R2": 0.883
     }
   },
   "feature_columns": [
@@ -35,15 +35,15 @@
     "hour_sin",
     "hour_cos"
   ],
-  "target": "memory_utilization at 15 minutes in the future",
-  "horizon_minutes": 15,
+  "target": "cpu_utilization at 60 minutes in the future",
+  "horizon_minutes": 60,
   "source_rows": 11899,
-  "training_samples": 7741,
-  "train_samples": 6192,
-  "test_samples": 1549,
-  "training_from": "2026-09-05T07:55:28.228270",
-  "training_to": "2026-09-09T17:57:41.804843",
-  "trained_at": "2026-09-11T12:36:02.158832",
+  "training_samples": 4593,
+  "train_samples": 3674,
+  "test_samples": 919,
+  "training_from": "2026-09-07T17:03:00.957475",
+  "training_to": "2026-09-09T17:13:04.833839",
+  "trained_at": "2026-09-11T12:36:04.644037",
   "selection_rule": "A complex model must beat Linear Regression by more than 5% relative MAE to be selected.",
   "limitation": "Forecast continues observed patterns; it cannot anticipate one-off traffic spikes or failures."
 }

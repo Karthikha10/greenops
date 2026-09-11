@@ -359,10 +359,22 @@ function CandidateCard({ c, isSelected, onSelect }) {
   // Three-way status, not just safe/unsafe: a candidate can look fine RIGHT
   // NOW (safe_now) but be predicted to get busy on its own soon enough to
   // cross the limit anyway (safe_forecast) -- see forecast_candidate_server()
-  // on the backend. c.safe is only true when both agree.
+  // on the backend. c.safe is only true when all of CPU/memory (now +
+  // forecast), network, and thermal agree.
   const riskySoon = c.safe_now && c.safe_forecast === false;
+  const networkOrThermalBlocked = c.network_ok === false || c.thermal_ok === false;
   const statusCls   = c.safe ? "good" : riskySoon ? "warn" : "danger";
-  const statusLabel = c.safe ? "Safe" : riskySoon ? "Risky soon" : "Over limit";
+  const statusLabel = c.safe
+    ? "Safe"
+    : riskySoon
+    ? "Risky soon"
+    : networkOrThermalBlocked
+    ? (c.network_ok === false && c.thermal_ok === false
+        ? "Network + thermal limit"
+        : c.network_ok === false
+        ? "Network limit"
+        : "Thermal limit")
+    : "Over limit";
 
   const hasForecast = c.forecast_available &&
     c.forecast_predicted_cpu !== null && c.forecast_predicted_cpu !== undefined;
@@ -408,6 +420,24 @@ function CandidateCard({ c, isSelected, onSelect }) {
           {" "}in ~15 min
         </div>
       )}
+      {(c.post_move_network_gbps != null || c.predicted_post_move_temp_c != null) && (
+        <div
+          className="rd-candidate-forecast"
+          title="Post-move network throughput and predicted inlet temperature -- stated conventions (25 Gbps NIC, 30°C ceiling), not measured capacities"
+        >
+          {c.post_move_network_gbps != null && (
+            <span style={{ color: c.network_ok === false ? "#E24B4A" : "inherit" }}>
+              {c.network_ok === false ? "⚠ " : ""}Network: {c.post_move_network_gbps.toFixed(1)} Gbps
+            </span>
+          )}
+          {c.post_move_network_gbps != null && c.predicted_post_move_temp_c != null && "  ·  "}
+          {c.predicted_post_move_temp_c != null && (
+            <span style={{ color: c.thermal_ok === false ? "#E24B4A" : "inherit" }}>
+              {c.thermal_ok === false ? "⚠ " : ""}Temp: {c.predicted_post_move_temp_c.toFixed(1)}°C
+            </span>
+          )}
+        </div>
+      )}
       {isSelected && <div className="rd-candidate-selected-hint">Currently selected target</div>}
     </button>
   );
@@ -418,6 +448,7 @@ function CandidateCard({ c, isSelected, onSelect }) {
 export default function RecommendationDetail() {
   const { id }   = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
 
   const [rec,       setRec]       = useState(null);
   const [loading,   setLoading]   = useState(true);
@@ -650,7 +681,6 @@ export default function RecommendationDetail() {
   const isStorage     = ["archive", "deduplicate", "rightsize"].includes(rec.recommendation_type);
   const rejected      = isConsolidate && baseImpact.safe === false;
 
-  const { user } = useAuth();
   const canDecide = user?.role === "infrastructure_manager";
 
   // Parse server type from the explanation string — backend always writes
@@ -658,15 +688,19 @@ export default function RecommendationDetail() {
   const serverTypeMatch = rec.explanation?.match(/threshold for ([^:]+):/i);
   const serverType = serverTypeMatch ? serverTypeMatch[1].trim() : "Compute";
 
-  // Show candidates that aren't over-limit RIGHT NOW -- a candidate whose
-  // own near-term forecast crosses the safety limit (safe_now true, safe
-  // false) still shows up here as "Risky soon", since an operator should
-  // be able to see and consciously override that, not have it silently
-  // hidden the same way a genuinely-over-limit-now candidate is. Fields
-  // predating this session's target-candidate forecasting (safe_now
-  // undefined) are treated as viewable, same as before.
+  // Show candidates that aren't over the CPU/memory limit RIGHT NOW --
+  // filtering on cpu_memory_ok_now specifically, not the combined safe_now,
+  // so a candidate rejected only on network or thermal grounds still shows
+  // up (same reasoning as "Risky soon" below: those are newer, less-
+  // established conventions than the CPU/memory limit, and an operator
+  // should be able to see and judge them, not have them silently vanish).
+  // A candidate whose own near-term CPU/memory forecast crosses the safety
+  // limit (safe_now true, safe false) still shows up here as "Risky soon"
+  // for the same reason. Fields predating this session's target-candidate
+  // forecasting (cpu_memory_ok_now undefined) are treated as viewable,
+  // same as before.
   const allCandidates  = baseImpact.candidates || [];
-  const safeCandidates = allCandidates.filter(c => c.safe_now !== false);
+  const safeCandidates = allCandidates.filter(c => c.cpu_memory_ok_now !== false);
 
   const hasEnergy  = (effectiveImpact?.estimated_energy_saving_kwh    || 0) > 0;
   const hasStorage = (effectiveImpact?.estimated_storage_reclaimed_gb || 0) > 0;
@@ -1002,8 +1036,8 @@ export default function RecommendationDetail() {
               <p className="rd-card-title" style={{ marginBottom: 4 }}>Target server</p>
               <p style={{ fontSize: 12.5, color: "var(--text-secondary)", margin: 0 }}>
                 {safeCandidates.length === 1
-                  ? "One migration target is currently viable. The impact estimates below reflect this server."
-                  : "Currently-viable migration targets, ranked by most headroom after the move — including any marked \"Risky soon\" whose own forecast predicts crossing the safety limit independently of this move. Click one to see how the impact estimates change."}
+                  ? "One candidate below the CPU/memory limit right now — check its badge, since it can still be marked \"Risky soon\" or blocked on network/thermal grounds. The impact estimates below reflect this server unless a different one is selected."
+                  : "Candidates below the CPU/memory limit right now, ranked by most headroom after the move — including any marked \"Risky soon\", \"Network limit\", or \"Thermal limit\", so you can see and judge what was considered, not just the top pick. Click one to see how the impact estimates change."}
               </p>
             </div>
           </div>
@@ -1096,7 +1130,7 @@ export default function RecommendationDetail() {
                       </span>
                       <span className="rd-impact-cell-sub">cooling load freed</span>
                       <div className="rd-impact-cell-tooltip">
-                        Energy saved × WUE factor for the source server's cooling type (Air: 0.3 L/kWh, Liquid: 0.9 L/kWh, Evaporative: 1.8 L/kWh). Freeing the server removes its cooling water draw.
+                        Energy saved × WUE factor for the source server's cooling type (Air: 0.3 L/kWh, Liquid: 0.9 L/kWh, Hybrid: 1.8 L/kWh). Freeing the server removes its cooling water draw.
                       </div>
                     </div>
                   )}

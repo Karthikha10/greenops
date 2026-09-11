@@ -80,11 +80,10 @@ class Forecast(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     server_id = Column(String, index=True)
-    horizon_minutes = Column(Integer, default=15)
+    horizon_minutes = Column(Integer, default=60)
     measured_cpu = Column(Float)
     predicted_cpu = Column(Float)
-    predicted_power_kw = Column(Float, nullable=True)
-    method = Column(String, default="trend_fallback")
+    method = Column(String, default="trend_extrapolation")
     model_version = Column(String, nullable=True)
     validation_mae = Column(Float, nullable=True)
     validation_rmse = Column(Float, nullable=True)
@@ -127,7 +126,6 @@ class Recommendation(Base):
     priority = Column(String, nullable=False)
     # high, medium, low
 
-    title = Column(String, nullable=False)
     explanation = Column(String, nullable=False)
 
     status = Column(String, default="pending")

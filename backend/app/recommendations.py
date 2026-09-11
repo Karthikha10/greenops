@@ -25,22 +25,18 @@ from . import forecasting, models, rules_engine
 RECOMMENDATION_MAP = {
     "idle_server": {
         "type": "consolidate",
-        "title": "Consolidate workload",
     },
 
     "stale_data": {
         "type": "archive",
-        "title": "Archive stale data",
     },
 
     "duplicate_data": {
         "type": "deduplicate",
-        "title": "Deduplicate storage",
     },
 
     "overprovisioned": {
         "type": "rightsize",
-        "title": "Rightsize storage",
     },
 }
 
@@ -125,7 +121,6 @@ def sync_recommendations(db: Session):
             recommendation.server_id = flag.server_id
             recommendation.recommendation_type = mapping["type"]
             recommendation.priority = priority
-            recommendation.title = mapping["title"]
             recommendation.explanation = explanation
 
             if recommendation.status == "snoozed" and (
@@ -151,7 +146,6 @@ def sync_recommendations(db: Session):
                 server_id=flag.server_id,
                 recommendation_type=mapping["type"],
                 priority=priority,
-                title=mapping["title"],
                 explanation=explanation,
                 status="pending",
             )
@@ -193,6 +187,33 @@ CARBON_INTENSITY_KG_PER_KWH = 0.5
 CONSOLIDATION_OVERHEAD_FACTOR = 0.9
 
 SAFETY_LIMIT_PERCENT = 75.0
+
+# Network safety limit -- a stated convention, not derived from data, same
+# spirit as the idle-threshold clamp. server_monitor.py's live network
+# formula (workload x 25 Gbps + noise) has no real notion of "capacity" to
+# check a percentage against, unlike CPU/memory which are naturally bounded
+# 0-100%, so this picks a real-world reference instead: a standard 25GbE
+# NIC, at the same 75% margin already used for CPU/memory.
+NETWORK_CAPACITY_GBPS = 25.0
+NETWORK_SAFETY_LIMIT_GBPS = NETWORK_CAPACITY_GBPS * (SAFETY_LIMIT_PERCENT / 100)
+
+# Thermal safety limit -- checked against a PREDICTED post-move inlet
+# temperature, not a raw sum (temperatures don't add across servers the way
+# CPU/memory/network load does). The prediction reuses cooling_monitor.py's
+# own generating formula (base + per-cooling-type rise x cpu fraction),
+# driven by the target's post_move_cpu, since that's what would actually
+# happen to its temperature once it takes on the extra workload. These
+# constants MUST be kept in sync with simulators/cooling_monitor.py's
+# BASE_TEMPERATURE_C / COOLING_TEMP_RISE_C -- duplicated here rather than
+# shared (the simulators and backend are already two separate deployables
+# with no shared package, the same reason WUE_FACTORS is independently
+# duplicated in rules_engine.py and twice more in the frontend). 30C is a
+# stated ceiling inspired by ASHRAE's allowable inlet-temperature range for
+# data center equipment (~32C upper bound for standard classes), not derived
+# from this project's own data.
+THERMAL_BASE_TEMPERATURE_C = 19.0
+THERMAL_COOLING_TEMP_RISE_C = {"Air": 9.0, "Hybrid": 5.0, "Liquid": 2.5}
+THERMAL_SAFETY_LIMIT_C = 30.0
 
 STORAGE_ACTION_RISK = 0.1
 
@@ -261,7 +282,7 @@ def _predict_power_kw(
         "server_type": server_meta.server_type,
         "cooling_type": server_meta.cooling_type,
         "datacenter_region": server_meta.datacenter_region,
-        "time_of_day": "Peak",
+        "time_of_day": rules_engine.get_time_of_day(cooling.timestamp),
         "cpu_utilization": cpu_value,
     }])
 
@@ -360,13 +381,57 @@ def _rank_consolidation_candidates(
             + source_memory * CONSOLIDATION_OVERHEAD_FACTOR
         )
 
+        current_network = float(
+            target_telemetry.network_throughput_gbps or 0
+        )
+
+        source_network = float(
+            source_telemetry.network_throughput_gbps or 0
+        )
+
+        post_move_network = (
+            current_network
+            + source_network * CONSOLIDATION_OVERHEAD_FACTOR
+        )
+
+        network_ok = post_move_network < NETWORK_SAFETY_LIMIT_GBPS
+
+        # Kept separate from safe_now (below) specifically so the frontend
+        # can still show a candidate that's only rejected on network/thermal
+        # grounds -- those are newer, less-established conventions than the
+        # CPU/memory limit, and an operator should be able to see and judge
+        # them the same way a "risky soon" forecast rejection stays visible,
+        # rather than having them vanish from the list the same way a
+        # genuinely CPU/memory-over-limit-right-now candidate does.
+        cpu_memory_ok_now = (
+            post_move_cpu < SAFETY_LIMIT_PERCENT
+            and post_move_memory < SAFETY_LIMIT_PERCENT
+        )
+
+        # Predicted post-move inlet temperature -- NOT a sum of two
+        # servers' temperatures (that isn't physically meaningful). This
+        # applies cooling_monitor.py's own load->temperature formula to the
+        # target's post-move CPU, i.e. "what would this target's own
+        # temperature become once it's carrying the extra workload."
+        predicted_post_move_temp_c = (
+            THERMAL_BASE_TEMPERATURE_C
+            + THERMAL_COOLING_TEMP_RISE_C.get(
+                candidate.cooling_type,
+                THERMAL_COOLING_TEMP_RISE_C["Air"],
+            )
+            * min(1.0, post_move_cpu / 100)
+        )
+
+        thermal_ok = predicted_post_move_temp_c < THERMAL_SAFETY_LIMIT_C
+
         # ----------------------------------------------------
         # Safety check -- current snapshot
         # ----------------------------------------------------
 
         safe_now = (
-            post_move_cpu < SAFETY_LIMIT_PERCENT
-            and post_move_memory < SAFETY_LIMIT_PERCENT
+            cpu_memory_ok_now
+            and network_ok
+            and thermal_ok
         )
 
         headroom_used_now = max(
@@ -450,6 +515,13 @@ def _rank_consolidation_candidates(
             "post_move_cpu": post_move_cpu,
             "post_move_memory": post_move_memory,
 
+            "post_move_network_gbps": post_move_network,
+            "network_ok": network_ok,
+
+            "predicted_post_move_temp_c": predicted_post_move_temp_c,
+            "thermal_ok": thermal_ok,
+
+            "cpu_memory_ok_now": cpu_memory_ok_now,
             "safe_now": safe_now,
 
             "forecast_available": forecast_available,
@@ -678,6 +750,20 @@ def calculate_what_if(
                     2,
                 ),
 
+                "post_move_network_gbps": round(
+                    c["post_move_network_gbps"],
+                    2,
+                ),
+                "network_ok": c["network_ok"],
+
+                "predicted_post_move_temp_c": round(
+                    c["predicted_post_move_temp_c"],
+                    2,
+                ),
+                "thermal_ok": c["thermal_ok"],
+
+                "cpu_memory_ok_now": c["cpu_memory_ok_now"],
+
                 "forecast_predicted_cpu": (
                     round(c["forecast_predicted_cpu"], 2)
                     if c["forecast_predicted_cpu"] is not None
@@ -729,11 +815,20 @@ def calculate_what_if(
                     if c["safe_now"] and not c["safe_forecast"]
                 )
 
+                rejected_by_network = sum(
+                    1 for c in ranked if not c["network_ok"]
+                )
+
+                rejected_by_thermal = sum(
+                    1 for c in ranked if not c["thermal_ok"]
+                )
+
                 result["assumptions"].append(
                     f"{len(ranked)} same-type server(s) considered, "
                     f"but none has headroom to absorb this workload "
                     f"without crossing {SAFETY_LIMIT_PERCENT:.0f}% "
-                    "CPU or memory -- rejected, not recommended to act on."
+                    "CPU or memory, saturating its network link, or "
+                    "running too hot -- rejected, not recommended to act on."
                 )
 
                 if rejected_only_by_forecast:
@@ -745,6 +840,27 @@ def calculate_what_if(
                         f"shows them crossing {SAFETY_LIMIT_PERCENT:.0f}% "
                         "on their own, independent of this move -- see "
                         "each candidate's forecast columns above."
+                    )
+
+                if rejected_by_network:
+
+                    result["assumptions"].append(
+                        f"{rejected_by_network} candidate(s) rejected on "
+                        f"network grounds -- post-move throughput would "
+                        f"exceed {NETWORK_SAFETY_LIMIT_GBPS:.1f} Gbps "
+                        f"(75% of an assumed {NETWORK_CAPACITY_GBPS:.0f} Gbps "
+                        "NIC capacity, a stated convention, not a measured "
+                        "limit)."
+                    )
+
+                if rejected_by_thermal:
+
+                    result["assumptions"].append(
+                        f"{rejected_by_thermal} candidate(s) rejected on "
+                        f"thermal grounds -- predicted post-move inlet "
+                        f"temperature would exceed {THERMAL_SAFETY_LIMIT_C:.0f}"
+                        "°C, estimated from the target's own cooling "
+                        "type and post-move CPU, not a raw sensor reading."
                     )
 
             else:
@@ -1181,6 +1297,16 @@ def calculate_what_if(
                 f"{best['current_memory']:.1f}% memory to "
                 f"{post_move_cpu:.1f}% CPU / "
                 f"{post_move_memory:.1f}% memory."
+            )
+
+            result["assumptions"].append(
+                f"Also checked: post-move network throughput "
+                f"({best['post_move_network_gbps']:.1f} Gbps, limit "
+                f"{NETWORK_SAFETY_LIMIT_GBPS:.1f}) and predicted post-move "
+                f"inlet temperature ({best['predicted_post_move_temp_c']:.1f}"
+                f"°C, limit {THERMAL_SAFETY_LIMIT_C:.0f}°C) -- both "
+                "within limits for this candidate. Both are stated "
+                "conventions, not measured capacities."
             )
 
             result["assumptions"].append(

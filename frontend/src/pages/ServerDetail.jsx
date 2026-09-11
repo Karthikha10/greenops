@@ -25,7 +25,7 @@ const MAX_HISTORY_HOURS = 24;
 // Same factors rules_engine.WUE_FACTORS uses server-side -- kept in sync
 // deliberately, since water use depends on THIS server's own cooling type,
 // not a fleet-wide average. Never hardcode a single factor for every server.
-const WUE_FACTORS = { Air: 0.3, Evaporative: 1.8, Liquid: 0.9 };
+const WUE_FACTORS = { Air: 0.3, Hybrid: 1.8, Liquid: 0.9 };
 
 /* ==========================================================================
    1. HELPER FUNCTIONS & FORMATTERS
@@ -33,6 +33,13 @@ const WUE_FACTORS = { Air: 0.3, Evaporative: 1.8, Liquid: 0.9 };
 
 function formatValue(value, suffix = "") {
   return value === null || value === undefined ? "—" : `${value}${suffix}`;
+}
+
+function formatHorizon(minutes) {
+  if (!minutes) return "—";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  return `${hours % 1 === 0 ? hours : hours.toFixed(1)}h`;
 }
 
 function timeLabel(timestamp) {
@@ -95,7 +102,7 @@ export default function ServerDetail() {
   const [rawHistory, setRawHistory] = useState([]);
   const [detail, setDetail] = useState(null);
   const [forecast, setForecast] = useState(null);
-  const [horizon, setHorizon] = useState(15);
+  const [horizon, setHorizon] = useState(60);
   const [loading, setLoading] = useState(true);
 
   // The real what-if impact for THIS server's own consolidate recommendation,
@@ -321,11 +328,11 @@ export default function ServerDetail() {
   }, [cpuData, cpuStats.highest, cpuStats.lowest, latest]);
 
   const forecastChart =
-    forecast?.eligible && latestCpu !== null
+    forecast?.eligible && forecast?.predicted_cpu !== null && latestCpu !== null
       ? [
           ...cpuChartData,
           {
-            time: `+${forecast.horizon_minutes}m`,
+            time: `+${formatHorizon(forecast.horizon_minutes)}`,
             cpu: Number(forecast.predicted_cpu),
             forecast: true,
           },
@@ -1462,22 +1469,22 @@ export default function ServerDetail() {
                 background: "#FFFFFF",
               }}
             >
-              <option value={15}>
-                Next 15 minutes
-              </option>
-
-              <option value={30}>
-                Next 30 minutes
-              </option>
-
               <option value={60}>
-                Next 60 minutes
+                Next 1 hour
+              </option>
+
+              <option value={360}>
+                Next 6 hours
+              </option>
+
+              <option value={1440}>
+                Next 24 hours
               </option>
             </select>
           </div>
         </div>
 
-        {forecast?.eligible ? (
+        {forecast?.eligible && forecast?.predicted_cpu !== null ? (
           <div className="forecast-pipeline-grid">
             <div className="pipeline-card">
               <div>
@@ -1499,8 +1506,16 @@ export default function ServerDetail() {
                 <div className="pipeline-desc">
                   Measured live vs. predicted load,{" "}
                   <strong>
-                    +{horizon} min
+                    +{formatHorizon(horizon)}
                   </strong>
+                  {forecast.method === "historical_average" && (
+                    <>
+                      {" "}(average over the last{" "}
+                      {forecast.lookback_hours_used}h of
+                      data — this horizon has no trained
+                      model yet)
+                    </>
+                  )}
                   .
                 </div>
               </div>
@@ -1613,6 +1628,21 @@ export default function ServerDetail() {
                 Review in Recommendations →
               </button>
             </div>
+          </div>
+        ) : forecast?.eligible ? (
+          <div
+            className="empty-state"
+            style={{
+              padding: "1.5rem",
+              marginTop: 14,
+            }}
+          >
+            Not enough history yet for a{" "}
+            {formatHorizon(horizon)} forecast —{" "}
+            {formatValue(forecast?.lookback_hours_used, "h")}{" "}
+            of data available so far for this server. Try
+            a shorter horizon, or check back once more
+            telemetry has accumulated.
           </div>
         ) : (
           <div
